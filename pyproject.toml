@@ -1,18 +1,63 @@
 [project]
-name = "hotpotqa"
-version = "0.1.0"
-description = "HotpotQA Question Answering Project"
+name = "hotpotqa-pipeline"
+version = "1.0.0"
+description = "Complete NLP pipeline for HotpotQA multi-hop question answering dataset"
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.10"
 dependencies = [
+    # Core dependencies
     "pandas>=2.0.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0.0",
+    "tqdm>=4.65.0",
+    # NLP and text processing
+    "nltk>=3.8.0",
+    "transformers>=4.30.0",
+    "torch>=2.0.0",
+    # Evaluation
+    "ujson>=5.7.0",
+    # Optional: Visualization
     "matplotlib>=3.7.0",
     "seaborn>=0.12.0",
-    "numpy>=1.24.0",
     "wordcloud>=1.9.0",
-    "nltk>=3.8.0",
+    # Optional: Notebooks
     "jupyter>=1.0.0",
     "ipykernel>=6.0.0",
+    # Optional: Model inference
     "mistralai>=1.0.0",
-    "python-dotenv>=1.0.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.3.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.3.0",
+    "flake8>=6.0.0",
+]
+spacy = [
+    "spacy>=3.5.0",
+]
+
+[project.scripts]
+hotpotqa-preprocess = "scripts.run_preprocessing:main"
+hotpotqa-validate = "scripts.validate_data:main"
+hotpotqa-analyze = "scripts.analyze_dataset:main"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_backend"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*", "scripts*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
