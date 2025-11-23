@@ -1,0 +1,18 @@
+[project]
+name = "hotpotqa"
+version = "0.1.0"
+description = "HotpotQA Question Answering Project"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "pandas>=2.0.0",
+    "matplotlib>=3.7.0",
+    "seaborn>=0.12.0",
+    "numpy>=1.24.0",
+    "wordcloud>=1.9.0",
+    "nltk>=3.8.0",
+    "jupyter>=1.0.0",
+    "ipykernel>=6.0.0",
+    "mistralai>=1.0.0",
+    "python-dotenv>=1.0.0",
+]
