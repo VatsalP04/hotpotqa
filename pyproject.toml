@@ -43,18 +43,6 @@ spacy = [
     "spacy>=3.5.0",
 ]
 
-[project.scripts]
-hotpotqa-preprocess = "scripts.run_preprocessing:main"
-hotpotqa-validate = "scripts.validate_data:main"
-hotpotqa-analyze = "scripts.analyze_dataset:main"
-
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_backend"
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["src*", "scripts*"]
 
 [tool.black]
 line-length = 100
