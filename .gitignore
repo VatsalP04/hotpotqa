@@ -61,6 +61,18 @@ results/predictions/*
 
 # Large data files (uncomment if you don't want to commit datasets)
 # data/hotpotqa/*.json
+data/raw/*.json
+data/raw/*.tar.bz2
+data/raw/*.tar.gz
+data/raw/*.zip
+data/cache/*.bz2
+data/cache/*.pkl
+enwiki-*
+
+# Embeddings and large external vectors
+data/embeddings/glove.*
+data/embeddings/*.zip
+data/embeddings/*.txt
 
 # Model files and checkpoints
 *.pt
