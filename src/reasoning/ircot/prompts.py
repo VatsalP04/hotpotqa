@@ -1,3 +1,40 @@
+"""
+IRCoT Prompt Engineering Module
+
+This module handles prompt construction for the IRCoT algorithm. It defines the data
+structures for few-shot demonstrations and provides functions to build prompts for
+different stages of the IRCoT pipeline.
+
+Key Components:
+- CoTDemo: Data structure for few-shot demonstrations
+- format_paragraphs(): Formats Wikipedia paragraphs in the IRCoT style
+- build_ircot_reason_prompt(): Builds prompts for iterative reasoning steps
+- build_reader_prompt_*(): Builds prompts for final answer generation
+
+Prompt Structure:
+IRCoT uses a specific prompt format that includes:
+1. Few-shot demonstrations showing multi-hop reasoning
+2. Retrieved Wikipedia paragraphs formatted consistently
+3. The current question and any partial reasoning
+4. Appropriate continuation prompts
+
+The prompt engineering is critical for IRCoT performance as it:
+- Teaches the model the expected reasoning format through examples
+- Provides consistent document formatting
+- Guides the model to generate single reasoning steps
+- Ensures proper answer extraction patterns
+
+Format Example:
+    Wikipedia Title: Document 1
+    [Document text]
+    
+    Wikipedia Title: Document 2  
+    [Document text]
+    
+    Q: [Question]
+    A: [Reasoning step 1. Reasoning step 2. So the answer is: Final Answer.]
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,66 +1,64 @@
 """
-Minimal demo wiring for IRCoT retriever + reader using the dummy LLM client.
+IRCoT Pipeline Demonstration Script
 
-Swap `EchoLLMClient` for `MistralLLMClient` (or your own implementation) to
-call a real model.
+This script demonstrates the complete IRCoT (Interleaving Retrieval with Chain-of-Thought)
+pipeline using production-ready components:
+
+Components Used:
+- FAISS-based dense retrieval using pre-built Wikipedia index (161 documents)
+- Mistral LLM for reasoning step generation and answer synthesis
+- Official few-shot prompts from the IRCoT repository
+- Real HotpotQA multi-hop questions
+
+Pipeline Flow:
+1. Load few-shot demonstrations from official IRCoT prompts
+2. Initialize FAISS retriever with pre-built Wikipedia index
+3. Initialize Mistral LLM client for text generation
+4. Run IRCoT iterative retrieval loop:
+   - Start with initial retrieval based on question
+   - Generate reasoning steps one sentence at a time
+   - Retrieve additional documents based on each reasoning step
+   - Continue until answer is found or limits reached
+5. Generate comprehensive final answer using QA reader
+
+This demonstrates the full IRCoT algorithm as described in the ACL 2023 paper,
+showing how iterative retrieval guided by reasoning steps can effectively
+handle complex multi-hop questions.
+
+Usage:
+    uv run python -m src.reasoning.ircot.run_ircot_example
 """
 
-from typing import List
+from pathlib import Path
 
 from .config import IRCoTConfig
+from .demo_loader import load_default_hotpot_demos
 from .ircot import IRCoTRetriever
-from .llm_client import EchoLLMClient
-from .prompts import CoTDemo
+from .llm_client import MistralLLMClient
 from .qa_reader import QAReader
-from .retriever import Paragraph, TfidfRetriever, build_corpus_from_texts
-
-
-def build_dummy_demos(paragraphs: List[Paragraph]) -> List[CoTDemo]:
-    """
-    Very small synthetic demos to illustrate structure.
-    Replace with real demos (few-shot examples) for actual experiments.
-    """
-
-    if len(paragraphs) < 2:
-        return []
-
-    demo1 = CoTDemo(
-        paragraphs=[paragraphs[0]],
-        question="Who wrote the hit song that X is most recognized for?",
-        cot_answer=(
-            "X is most recognized for the hit song 'Example Song'. "
-            "'Example Song' was written by Example Author. "
-            "So the answer is: Example Author."
-        ),
-    )
-
-    demo2 = CoTDemo(
-        paragraphs=[paragraphs[1]],
-        question="In what country was Example Coaster manufactured?",
-        cot_answer=(
-            "Example Coaster was manufactured by Example Rides. "
-            "Example Rides is a company from Exampleland. "
-            "So the answer is: Exampleland."
-        ),
-    )
-
-    return [demo1, demo2]
+from .retriever import load_faiss_retriever_from_notebooks
 
 
 def main() -> None:
-    texts = [
-        "Example Rides is a roller coaster manufacturer based in Exampleland.",
-        "Example Author wrote the hit song 'Example Song' in 1999.",
-        "Another document about some unrelated topic.",
-    ]
-    titles = ["Example Rides", "Example Song", "Unrelated Doc"]
-
-    paragraphs = build_corpus_from_texts(texts, titles=titles)
-    retriever = TfidfRetriever(paragraphs)
-    llm = EchoLLMClient()  # Swap to MistralLLMClient for real completions
     config = IRCoTConfig()
-    demos = build_dummy_demos(paragraphs)
+    demos = load_default_hotpot_demos(max_examples=config.max_demos)
+    
+    print("=== IRCoT Pipeline Demo ===")
+    print(f"Loaded {len(demos)} few-shot demonstrations")
 
+    # Load FAISS retriever
+    project_root = Path(__file__).resolve().parents[3]  # Go up to hotpotqa/
+    notebooks_dir = project_root / "notebooks"
+    
+    print(f"Loading FAISS index from: {notebooks_dir}")
+    retriever = load_faiss_retriever_from_notebooks(str(notebooks_dir))
+    print("✅ FAISS retriever loaded successfully")
+
+    # Initialize Mistral LLM
+    llm = MistralLLMClient()
+    print("✅ MistralLLMClient initialized")
+
+    # Initialize IRCoT components
     ircot = IRCoTRetriever(
         retriever=retriever,
         llm=llm,
@@ -74,25 +72,38 @@ def main() -> None:
         config=config,
     )
 
-    question = "In what country was Example Coaster manufactured?"
+    # Use first demo question
+    question = demos[0].question if demos else "What album was Nobody Loves You written by John Lennon released on?"
+    print(f"\n=== Question ===")
+    print(f"Q: {question}")
+
+    # Run IRCoT retrieval loop
+    print(f"\n=== Running IRCoT Retrieval Loop ===")
     ircot_result = ircot.run(question)
 
-    print("=== IRCoT CoT Steps ===")
-    for i, s in enumerate(ircot_result.cot_steps, start=1):
-        print(f"[{i}] {s}")
+    print(f"\n=== IRCoT Chain-of-Thought Steps ===")
+    if ircot_result.cot_steps:
+        for i, step in enumerate(ircot_result.cot_steps, start=1):
+            print(f"[{i}] {step}")
+    else:
+        print("No reasoning steps generated")
 
-    print("\n=== Retrieved Paragraph Titles ===")
-    for p in ircot_result.retrieved_paragraphs:
-        print(f"- {p.title}")
+    print(f"\n=== Retrieved Paragraphs ({len(ircot_result.retrieved_paragraphs)}) ===")
+    for i, p in enumerate(ircot_result.retrieved_paragraphs, start=1):
+        print(f"{i}. {p.title}")
+        print(f"   {p.text[:100]}...")
 
+    # Generate final answer
+    print(f"\n=== Generating Final Answer ===")
     qa_result = reader.answer(
         question=ircot_result.question,
         paragraphs=ircot_result.retrieved_paragraphs,
     )
 
-    print("\n=== Reader Output ===")
-    print("Answer:", qa_result.answer)
-    print("Full CoT / Text:\n", qa_result.cot)
+    print(f"\n=== Final Results ===")
+    print(f"Answer: {qa_result.answer}")
+    print(f"\nFull Reasoning:")
+    print(qa_result.cot)
 
 
 if __name__ == "__main__":

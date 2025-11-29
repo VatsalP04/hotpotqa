@@ -1,3 +1,29 @@
+"""
+IRCoT QA Reader Module
+
+This module implements the final answer generation component of the IRCoT pipeline.
+After the iterative retrieval loop completes, the QA Reader takes all retrieved
+documents and generates a comprehensive final answer.
+
+Key Classes:
+- QAReader: Generates final answers from retrieved context
+- QAResult: Container for the final answer and reasoning chain
+
+The QA Reader is a separate component from the iterative retrieval loop, following
+the two-stage design from the IRCoT paper:
+1. IRCoT Retriever: Iteratively builds up relevant context through reasoning
+2. QA Reader: Generates the final answer from all collected context
+
+This separation allows for:
+- Different prompting strategies for retrieval vs. answer generation
+- Longer, more comprehensive final answers
+- Better answer extraction and formatting
+- Flexibility in reader implementation (CoT vs. direct answering)
+
+The reader supports both chain-of-thought and direct answering modes, with
+configurable few-shot demonstrations and answer extraction patterns.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,7 +45,23 @@ class QAResult:
 
 class QAReader:
     """
-    Separate reader module, as in the IRCoT paper.
+    Separate reader module for final answer generation, as described in the IRCoT paper.
+    
+    The QA Reader takes the documents retrieved by the IRCoT loop and generates
+    a comprehensive final answer. This two-stage approach (retrieve then read)
+    allows for different optimization strategies and prompt designs.
+    
+    The reader can operate in two modes:
+    1. Chain-of-Thought: Generates step-by-step reasoning before the final answer
+    2. Direct: Generates the answer directly from the context
+    
+    The reader uses the same few-shot demonstrations as the retrieval loop but
+    with different prompting to focus on answer generation rather than retrieval.
+    
+    Args:
+        llm: Language model for answer generation
+        demos: Few-shot demonstrations for in-context learning
+        config: Configuration parameters including reader mode and token limits
     """
 
     def __init__(
