@@ -160,4 +160,3 @@ class IRCoTRetriever:
             cot_steps=cot_steps,
             retrieved_paragraphs=retrieved,
         )
-

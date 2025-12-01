@@ -143,4 +143,3 @@ def build_reader_prompt_direct(
     parts.append("A: ")
 
     return "\n\n".join(parts)
-

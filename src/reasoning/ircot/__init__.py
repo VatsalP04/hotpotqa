@@ -47,7 +47,11 @@ from .retriever import (
     Paragraph, 
     Retriever, 
     FAISSRetriever,
-    load_faiss_retriever_from_notebooks
+    InMemoryRetriever,
+    Sentence,
+    ParagraphWithSentences,
+    DistractorRetrieverAdapter,
+    load_faiss_retriever_from_notebooks,
 )
 
 __all__ = [
@@ -64,6 +68,10 @@ __all__ = [
     "Paragraph",
     "Retriever",
     "FAISSRetriever",
+    "InMemoryRetriever",
+    "Sentence",
+    "ParagraphWithSentences",
+    "DistractorRetrieverAdapter",
     "load_faiss_retriever_from_notebooks",
 ]
 

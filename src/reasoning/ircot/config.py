@@ -54,4 +54,3 @@ class IRCoTConfig:
 
     # Misc
     answer_trigger: str = "answer is"
-

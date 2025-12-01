@@ -36,7 +36,7 @@ import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Protocol
+from typing import List, Optional, Protocol, Tuple, Dict
 
 import numpy as np
 
@@ -167,8 +167,6 @@ class FAISSRetriever:
         return results
 
 
-
-
 def load_faiss_retriever_from_notebooks(notebooks_dir: str = "notebooks") -> FAISSRetriever:
     """
     Convenience function to load FAISS retriever from the notebooks directory.
@@ -193,3 +191,143 @@ def load_faiss_retriever_from_notebooks(notebooks_dir: str = "notebooks") -> FAI
         metadata_path=str(metadata_path)
     )
 
+# For distractor setting
+
+# Represents a single sentence with its source info for supporting fact tracking.
+@dataclass
+class Sentence:
+    title: str
+    sent_idx: int
+    text: str
+    
+    @property
+    def sp_tuple(self) -> Tuple[str, int]:
+        return (self.title, self.sent_idx)
+
+
+# Extended paragraph that tracks individual sentences for SP evaluation.
+@dataclass
+class ParagraphWithSentences:
+    title: str
+    sentences: List[str]
+    
+    @property
+    def full_text(self) -> str:
+        return " ".join(self.sentences)
+    
+    def get_all_sentences(self) -> List[Sentence]:
+        return [
+            Sentence(title=self.title, sent_idx=i, text=s)
+            for i, s in enumerate(self.sentences)
+        ]
+
+
+class InMemoryRetriever:
+    def __init__(
+        self, 
+        paragraphs: List[Paragraph], 
+        mistral_client,
+        embedding_model: str = "mistral-embed"
+    ):
+        self.paragraphs = paragraphs
+        self.client = mistral_client
+        self.embedding_model = embedding_model
+        self.embeddings = np.array([])
+
+        if not paragraphs:
+            return
+
+        # Batch embed all paragraphs
+        texts = [p.text for p in paragraphs]
+        try:
+            resp = self.client.embeddings.create(
+                model=self.embedding_model,
+                inputs=texts
+            )
+            emb_list = [item.embedding for item in resp.data]
+            self.embeddings = np.array(emb_list, dtype="float32")
+            
+            # Normalize for cosine similarity
+            norm = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+            self.embeddings = self.embeddings / (norm + 1e-10)
+        except Exception as e:
+            print(f"Embedding error: {e}")
+            self.embeddings = np.zeros((len(texts), 1024), dtype="float32")
+
+    # Retrieve top_k most relevant paragraphs for the query.
+    def retrieve(self, query: str, top_k: int) -> List[Paragraph]:
+        if self.embeddings.size == 0:
+            return []
+            
+        try:
+            resp = self.client.embeddings.create(
+                model=self.embedding_model,
+                inputs=[query]
+            )
+            q_vec = np.array(resp.data[0].embedding, dtype="float32").reshape(1, -1)
+            
+            norm = np.linalg.norm(q_vec)
+            q_vec = q_vec / (norm + 1e-10)
+            
+            scores = np.dot(self.embeddings, q_vec.T).flatten()
+            top_indices = np.argsort(scores)[::-1][:top_k]
+            
+            return [self.paragraphs[i] for i in top_indices]
+        except Exception as e:
+            print(f"Retrieval error: {e}")
+            return []
+
+# Adapter that wraps InMemoryRetriever to track supporting facts at sentence level.
+class DistractorRetrieverAdapter:
+    def __init__(
+        self, 
+        retriever: InMemoryRetriever, 
+        paragraphs_with_sentences: List[ParagraphWithSentences],
+        top_k_paragraphs: int = 2
+    ):
+        self.retriever = retriever
+        self.paragraphs_with_sentences = paragraphs_with_sentences
+        self.top_k_paragraphs = top_k_paragraphs
+        self.retrieved_sp: List[Tuple[str, int]] = []
+        self.retrieved_sentences: List[Sentence] = []
+        
+        # Build title -> ParagraphWithSentences lookup
+        self.title_to_para: Dict[str, ParagraphWithSentences] = {
+            p.title: p for p in paragraphs_with_sentences
+        }
+    
+    # Retrieve paragraphs and track all their sentences for SP evaluation.
+    def retrieve(self, query: str, top_k: int) -> List[Paragraph]:
+        paragraphs = self.retriever.retrieve(query, self.top_k_paragraphs)
+        
+        for para in paragraphs:
+            # Look up the full sentence info
+            para_with_sents = self.title_to_para.get(para.title)
+            if para_with_sents:
+                for sent in para_with_sents.get_all_sentences():
+                    sp_tuple = sent.sp_tuple
+                    if sp_tuple not in set(self.retrieved_sp):
+                        self.retrieved_sp.append(sp_tuple)
+                        self.retrieved_sentences.append(sent)
+        
+        return paragraphs
+    
+    # Get unique supporting facts as list of [title, sent_idx] pairs.
+    def get_supporting_facts(self) -> List[List]:
+        seen = set()
+        unique_sp = []
+        for sp in self.retrieved_sp:
+            if sp not in seen:
+                seen.add(sp)
+                unique_sp.append(list(sp))
+        return unique_sp
+    
+    # Get unique retrieved sentence texts.
+    def get_unique_retrieved_texts(self) -> List[str]:
+        seen = set()
+        unique_texts = []
+        for sent in self.retrieved_sentences:
+            if sent.sp_tuple not in seen:
+                seen.add(sent.sp_tuple)
+                unique_texts.append(sent.text)
+        return unique_texts

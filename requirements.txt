@@ -38,3 +38,5 @@ ipykernel>=6.0.0
 
 # Evaluation
 ujson>=5.7.0  # For faster JSON parsing in evaluation
+
+faiss-cpu>=1.0.0
