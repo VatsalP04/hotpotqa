@@ -18,6 +18,7 @@ from src.reasoning.ircot import (
     IRCoTRetriever,
     IRCoTConfig,
     QAReader,
+    config,
     load_default_hotpot_demos,
     InMemoryRetriever,
     Paragraph,
@@ -152,6 +153,33 @@ def get_gold_sentence_texts(context: List[List], gold_sp: List[List]) -> List[st
             texts.append(f"[NOT FOUND: {sp[0]}:{sp[1]}]")
     
     return texts
+def check_sp_explosion(predicted_sp, gold_sp, threshold_ratio=2.0, precision_threshold=0.4):
+    """
+    Determine if supporting fact explosion occurred.
+    
+    Explosion defined as:
+    - Predicted SP count > threshold_ratio × gold SP count
+    - AND precision < precision_threshold
+    
+    Returns: (bool, explanation_string)
+    """
+    pred_count = len(predicted_sp)
+    gold_count = len(gold_sp)
+    
+    pred_set = set(map(tuple, predicted_sp))
+    gold_set = set(map(tuple, gold_sp))
+    
+    tp = len(pred_set & gold_set)
+    fp = len(pred_set - gold_set)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+    explosion = (pred_count > threshold_ratio * gold_count) and (precision < precision_threshold)
+
+    explanation = (
+        f"Pred {pred_count} vs Gold {gold_count} | "
+        f"Precision {precision:.3f} | Explosion: {explosion}"
+    )
+    return explosion, explanation
 
 def run_evaluation(
     llm: Any,
@@ -224,6 +252,16 @@ def run_evaluation(
             predictions["answer"][qid] = cleaned_answer
             sp_list = retriever_adapter.get_supporting_facts()
             predictions["sp"][qid] = sp_list
+
+            # --- SP EXPLOSION ANALYSIS ---
+            sp_explosion, sp_expl_msg = check_sp_explosion(sp_list, gold_sp)
+
+            print("----- SP EXPLOSION DEBUG -----")
+            print("Predicted SPs:", sp_list)
+            print("Gold SPs:", gold_sp)
+            print(sp_expl_msg)
+            print("------------------------------")
+
             
             # Calculate per-example metrics
             ans_f1, ans_prec, ans_recall = f1_score(cleaned_answer, gold_answer)
@@ -253,6 +291,13 @@ def run_evaluation(
             row['num_subanswers'] = len(method_result.sub_answers)
             row['num_retrieved'] = len(retrieved_texts)
             row['num_gold'] = len(gold_texts)
+
+            # --- SP explosion fields ---
+            row['sp_explosion'] = int(sp_explosion)
+            row['sp_explosion_msg'] = sp_expl_msg
+            row['num_pred_sp'] = len(sp_list)   # predicted SP count
+            row['num_gold_sp'] = len(gold_sp)   # gold SP count
+
             
             for idx, text in enumerate(retrieved_texts):
                 row[f'retrieved_{idx+1}'] = text
@@ -283,6 +328,25 @@ def run_evaluation(
                 'num_gold': len(gold_sp),
             })
     
+    # ---- Build metadata row for experiment ----
+    metadata = {
+        "experiment_id": f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        "method": method,
+        "llm_model": getattr(llm, "model_name", "unknown"),
+        "embedding_model": getattr(embedder_client, "embedding_model", "unknown"),
+        "top_k": top_k_paragraphs,
+        "max_examples": len(dev_data),
+        "shuffle_data": getattr(args, "shuffle_data", False),
+        "seed": getattr(args, "seed", None)
+    }
+
+    # Convert configs to JSON so it's readable
+    try:
+        metadata["config"] = json.dumps(config.__dict__)
+    except:
+        metadata["config"] = str(config)
+
+
     # Save if paths provided
     if output_path:
         with open(output_path, 'w') as f:
@@ -290,37 +354,59 @@ def run_evaluation(
         print(f"Predictions saved to {output_path}")
     
     if csv_path:
-        save_csv(csv_rows, csv_path)
+        save_csv(csv_rows,metadata, csv_path)
         print(f"CSV saved to {csv_path}")
     
-    return predictions, csv_rows
+    return predictions, csv_rows, metadata
 
 
-def save_csv(csv_rows: List[Dict], csv_path: Path):
-    base_columns = ['question', 'correct', 'sp_precision', 'sp_recall', 
+def save_csv(csv_rows: List[Dict], metadata: Dict, csv_path: Path):
+    base_columns = ['question', 'correct', 'sp_precision', 'sp_recall',
                     'generated_answer', 'gold_answer']
-    
+
     max_subqueries = max((row.get('num_subqueries', 0) for row in csv_rows), default=0)
     max_subanswers = max((row.get('num_subanswers', 0) for row in csv_rows), default=0)
     max_retrieved = max((row.get('num_retrieved', 0) for row in csv_rows), default=0)
     max_gold = max((row.get('num_gold', 0) for row in csv_rows), default=0)
-    
+
     subquery_columns = [f'subquery_{i+1}' for i in range(max_subqueries)]
     subanswer_columns = [f'subanswer_{i+1}' for i in range(max_subanswers)]
     count_columns = ['num_retrieved', 'num_gold']
     retrieved_columns = [f'retrieved_{i+1}' for i in range(max_retrieved)]
     gold_columns = [f'gold_{i+1}' for i in range(max_gold)]
-    
-    all_columns = (base_columns + subquery_columns + subanswer_columns + 
-                   count_columns + retrieved_columns + gold_columns)
-    
+
+    all_columns = (
+        base_columns +
+        subquery_columns +
+        subanswer_columns +
+        count_columns +
+        retrieved_columns +
+        gold_columns
+    )
+
+    # Build metadata header
+    metadata_header = list(metadata.keys())
+    metadata_values = [metadata[k] for k in metadata_header]
+
     with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f)
+
+        # ---- Write metadata row ----
+        writer.writerow(metadata_header)
+        writer.writerow(metadata_values)
+        writer.writerow([])   # blank line for readability
+
+        # ---- Write results table ----
         writer = csv.DictWriter(f, fieldnames=all_columns, extrasaction='ignore')
         writer.writeheader()
+
         for row in csv_rows:
             writer.writerow(row)
 
 def main():
+    exp_dir = PROJECT_ROOT / "experiments"
+    exp_dir.mkdir(exist_ok=True)
+
     parser = argparse.ArgumentParser(description="Run QA pipeline evaluation")
     parser.add_argument("--method", type=str, choices=["decomposition", "ircot"], 
                         default="decomposition", help="QA method to use")
@@ -352,10 +438,23 @@ def main():
     llm = MistralLLMClient()
     
     # 3. Run evaluation
-    output_path = PROJECT_ROOT / args.output
-    csv_path = PROJECT_ROOT / args.csv_output
-    
-    predictions, csv_rows = run_evaluation(
+    # ---- Save to experiments folder with unique filenames ----
+    from datetime import datetime
+
+    exp_dir = PROJECT_ROOT / "experiments"
+    exp_dir.mkdir(exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    output_path = exp_dir / f"predictions_{timestamp}.json"
+    csv_path = exp_dir / f"results_{timestamp}.csv"
+
+    print(f"\n📁 Output will be saved to:")
+    print(f"   {output_path}")
+    print(f"   {csv_path}")
+
+
+    predictions, csv_rows, metadata = run_evaluation(
         llm=llm,
         embedder_client=llm,  # Same client for embeddings
         dev_data=dev_data,
