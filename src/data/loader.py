@@ -81,10 +81,28 @@ class HotpotQALoader:
 
         try:
             with open(self.file_path, 'r', encoding='utf-8') as f:
-                self.data = json.load(f)
+                content = f.read()
+                # Check if file contains an error message (e.g., "404: Not Found")
+                # Only check the first 20 characters to avoid false positives from data content
+                content_start = content.strip()[:20]
+                if content_start.startswith("404") or content_start == "404: Not Found":
+                    raise FileNotFoundError(
+                        f"Dataset file appears to be an error response, not valid data: {self.file_path}\n"
+                        f"File contents: {content[:100]}\n"
+                        f"Please download the HotpotQA dataset using the download script in data/hotpotqa/download.sh"
+                    )
+                self.data = json.loads(content)
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse JSON file: {e}")
-            raise
+            # Read first few lines to help debug
+            with open(self.file_path, 'r', encoding='utf-8') as f:
+                preview = f.read(200)
+            raise json.JSONDecodeError(
+                f"Invalid JSON format in {self.file_path}. "
+                f"File preview: {preview}...\n"
+                f"Please ensure the dataset file is properly downloaded.",
+                e.doc, e.pos
+            )
 
         logger.info(f"Loaded {len(self.data)} examples from {self.split} split")
 
