@@ -34,8 +34,8 @@ OUTPUT_DIR = str(project_root / "outputs" / "simple_cot")
 TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_dataset.csv")
 VAL_CSV_PATH = os.path.join(OUTPUT_DIR, "val_dataset.csv")
 
-BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 16
+BATCH_SIZE = 32
+GRADIENT_ACCUMULATION_STEPS = 1
 NUM_EPOCHS = 3
 LEARNING_RATE = 1e-4
 MAX_SEQ_LEN = 512
@@ -77,10 +77,15 @@ def get_answer_token_index(tokenizer, prompt: str, answer: str) -> int:
     answer_end_idx = len(full_tokens) - 1
     return answer_end_idx
 
-#%%
+#%% 
 # Load Model
 print("\nLoading model with TransformerLens...")
-model = HookedTransformer.from_pretrained(MODEL_NAME, device="cuda" if torch.cuda.is_available() else "cpu")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model = HookedTransformer.from_pretrained(
+    MODEL_NAME,
+    device=device,
+    dtype="bfloat16" if device == "cuda" else "float32",
+)
 model.eval()
 
 for param in model.parameters():
@@ -226,60 +231,53 @@ if __name__ == "__main__":
             
             batch_labels = torch.tensor(batch_labels, dtype=torch.float32).to(model.cfg.device)
             
-            # Clear cache before forward pass
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            
             # Tokenize full texts
-            max_len = max(len(tokenizer.encode(t, add_special_tokens=False)) for t in batch_full_texts)
-            max_len = min(max_len, MAX_SEQ_LEN)
-            
             tokenized = tokenizer(
                 batch_full_texts,
                 return_tensors="pt",
                 padding=True,
                 truncation=True,
-                max_length=max_len
+                max_length=MAX_SEQ_LEN,
             ).to(model.cfg.device)
             
             # Clear batch_full_texts before forward pass
             del batch_full_texts
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             
-            # Run model once with cache to get activations
+            # Run model once with cache to get activations (only cache hook_resid_post)
             with torch.no_grad():
                 _, cache = model.run_with_cache(
                     tokenized.input_ids,
-                    return_type=None
+                    return_type=None,
+                    names_filter=lambda name: name.endswith("hook_resid_post"),
                 )
             
-            # Extract hidden states for all layers
+            # Extract hidden states for all layers (keep in bf16 to save memory)
             hidden_states_list = []
             for layer_idx in range(num_layers):
                 layer_key = f"blocks.{layer_idx}.hook_resid_post"
                 if layer_key in cache:
-                    hidden_states_list.append(cache[layer_key].detach().clone())
+                    # keep in bf16 to save memory, we can cast to float for the probes later
+                    hidden_states_list.append(cache[layer_key])
                 else:
                     hidden_states_list.append(torch.zeros(
                         (tokenized.input_ids.shape[0], tokenized.input_ids.shape[1], d_model),
-                        dtype=torch.float32,
+                        dtype=torch.bfloat16,
                         device=model.cfg.device
                     ))
             
             # Clear cache and tokenized tensors
             del cache, tokenized
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
             
-            hidden_states = torch.stack(hidden_states_list, dim=1)
+            hidden_states = torch.stack(hidden_states_list, dim=1)  # (batch, layers, seq, d_model)
             del hidden_states_list
+            
+            # do probe math in fp32 if you like
+            hidden_states_for_probes = hidden_states.float()
             
             answer_indices = torch.tensor(batch_answer_indices, device=model.cfg.device)
             
-            batch_size_actual = hidden_states.shape[0]
-            seq_len_actual = hidden_states.shape[2]
+            batch_size_actual = hidden_states_for_probes.shape[0]
+            seq_len_actual = hidden_states_for_probes.shape[2]
             
             if batch_size_actual != len(batch_labels):
                 batch_labels = batch_labels[:batch_size_actual]
@@ -292,9 +290,9 @@ if __name__ == "__main__":
                 baseline_optimizer.zero_grad()
                 attention_optimizer.zero_grad()
             
-            # Forward pass through probes
-            baseline_logits = baseline_probe(hidden_states, answer_indices)
-            attention_logits = attention_probe(hidden_states)
+            # Forward pass through probes (use fp32 version)
+            baseline_logits = baseline_probe(hidden_states_for_probes, answer_indices)
+            attention_logits = attention_probe(hidden_states_for_probes)
             
             # Compute losses for all layers
             baseline_loss = 0.0
@@ -333,9 +331,7 @@ if __name__ == "__main__":
             train_attention_losses.append(attention_loss.item())
             
             # Clear intermediate tensors
-            del hidden_states, baseline_logits, attention_logits, total_loss
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            del hidden_states, hidden_states_for_probes, baseline_logits, attention_logits, total_loss
         
         # Handle any remaining accumulated gradients at the end of the epoch
         if accumulation_counter > 0:
@@ -399,53 +395,47 @@ if __name__ == "__main__":
                 
                 batch_labels = torch.tensor(batch_labels, dtype=torch.float32).to(model.cfg.device)
                 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-                
-                max_len = max(len(tokenizer.encode(t, add_special_tokens=False)) for t in batch_full_texts)
-                max_len = min(max_len, MAX_SEQ_LEN)
-                
                 tokenized = tokenizer(
                     batch_full_texts,
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
-                    max_length=max_len
+                    max_length=MAX_SEQ_LEN,
                 ).to(model.cfg.device)
                 
                 del batch_full_texts
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 
                 _, cache = model.run_with_cache(
                     tokenized.input_ids,
-                    return_type=None
+                    return_type=None,
+                    names_filter=lambda name: name.endswith("hook_resid_post"),
                 )
                 
                 hidden_states_list = []
                 for layer_idx in range(num_layers):
                     layer_key = f"blocks.{layer_idx}.hook_resid_post"
                     if layer_key in cache:
-                        hidden_states_list.append(cache[layer_key].detach().clone())
+                        # keep in bf16 to save memory, we can cast to float for the probes later
+                        hidden_states_list.append(cache[layer_key])
                     else:
                         hidden_states_list.append(torch.zeros(
                             (tokenized.input_ids.shape[0], tokenized.input_ids.shape[1], d_model),
-                            dtype=torch.float32,
+                            dtype=torch.bfloat16,
                             device=model.cfg.device
                         ))
                 
                 del cache, tokenized
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
                 
-                hidden_states = torch.stack(hidden_states_list, dim=1)
+                hidden_states = torch.stack(hidden_states_list, dim=1)  # (batch, layers, seq, d_model)
                 del hidden_states_list
+                
+                # do probe math in fp32 if you like
+                hidden_states_for_probes = hidden_states.float()
                 
                 answer_indices = torch.tensor(batch_answer_indices, device=model.cfg.device)
                 
-                batch_size_actual = hidden_states.shape[0]
-                seq_len_actual = hidden_states.shape[2]
+                batch_size_actual = hidden_states_for_probes.shape[0]
+                seq_len_actual = hidden_states_for_probes.shape[2]
                 
                 if batch_size_actual != len(batch_labels):
                     batch_labels = batch_labels[:batch_size_actual]
@@ -453,8 +443,8 @@ if __name__ == "__main__":
                 
                 answer_indices = torch.clamp(answer_indices, 0, seq_len_actual - 1)
                 
-                baseline_logits = baseline_probe(hidden_states, answer_indices)
-                attention_logits = attention_probe(hidden_states)
+                baseline_logits = baseline_probe(hidden_states_for_probes, answer_indices)
+                attention_logits = attention_probe(hidden_states_for_probes)
                 
                 baseline_loss = 0.0
                 attention_loss = 0.0
@@ -476,9 +466,7 @@ if __name__ == "__main__":
                 val_attention_losses.append(attention_loss.item())
                 val_labels_list.extend(batch_labels.cpu().numpy())
                 
-                del hidden_states, baseline_logits, attention_logits
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                del hidden_states, hidden_states_for_probes, baseline_logits, attention_logits
         
         #%%
         # Compute and Save Metrics

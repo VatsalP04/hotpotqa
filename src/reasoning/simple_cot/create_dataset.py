@@ -44,7 +44,7 @@ TRAIN_CSV_PATH = os.path.join(OUTPUT_DIR, "train_dataset.csv")
 VAL_CSV_PATH = os.path.join(OUTPUT_DIR, "val_dataset.csv")
 
 # Performance settings
-USE_PARALLEL = True  # Set to False to process sequentially (useful for debugging)
+USE_PARALLEL = (MODEL_TYPE == "mistral")  # parallel only for API model
 MAX_WORKERS = 5  # Number of parallel workers (adjust based on API rate limits)
 SAVE_INTERVAL = 10  # Save to CSV every N questions (small for frequent incremental saves)
 RETRIEVAL_K = 3  # Number of paragraphs to retrieve (matches SimpleCoT default)
@@ -66,7 +66,12 @@ if MODEL_TYPE == "llama":
     from transformer_lens import HookedTransformer
     import torch
     
-    model = HookedTransformer.from_pretrained(MODEL_NAME, device="cuda" if torch.cuda.is_available() else "cpu")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = HookedTransformer.from_pretrained(
+        MODEL_NAME,
+        device=device,
+        dtype="bfloat16" if device == "cuda" else "float32",
+    )
     model.eval()
     
     from src.reasoning.simple_cot.llm_client import HookedTransformerLLMClient
