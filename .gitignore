@@ -68,7 +68,6 @@ data/raw/*.zip
 data/cache/*.bz2
 data/cache/*.pkl
 enwiki-*
-*.csv
 *.json
 
 # Embeddings and large external vectors
