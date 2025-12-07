@@ -1,4 +1,27 @@
 #%%
+import sys
+from pathlib import Path
+
+# Add workspace root to Python path for notebook execution
+# Try to find the workspace root (parent of mateo directory)
+try:
+    # If running as script, use __file__
+    workspace_root = Path(__file__).parent.parent
+except NameError:
+    # If running in notebook, search upward from current directory
+    current = Path.cwd()
+    while current != current.parent:
+        if (current / "mateo").exists() and (current / "mateo" / "__init__.py").exists():
+            workspace_root = current
+            break
+        current = current.parent
+    else:
+        # Fallback: assume we're in workspace root or one level down
+        workspace_root = Path.cwd() if (Path.cwd() / "mateo").exists() else Path.cwd().parent
+
+if str(workspace_root) not in sys.path:
+    sys.path.insert(0, str(workspace_root))
+
 from mateo.decomposition import run_decomposition
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
@@ -16,7 +39,7 @@ MODEL = HookedTransformer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
 RETRIEVER = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
 
 #%%
-TRAIN_DATASET = load_dataset("hotpotqa", "train")
+TRAIN_DATASET = load_dataset("hotpot_qa", "distractor", split="train")
 
 #%%
 TRAIN_SAMPLE_SIZE = 28000
@@ -25,7 +48,7 @@ TEST_SAMPLE_SIZE = 7000
 SAVE_FREQUENCY = 10
 METHOD = "decomposition"
 PREDICTIONS_PATH = f"{METHOD}_predictions.json"
-CSV_PATH = f"{METHOD}.csv"
+DATASET_PATH = f"{METHOD}_dataset.json"
 
 #%%
 def normalize_answer(s):
@@ -70,16 +93,50 @@ def f1_score(prediction, ground_truth):
 
 def extract_gold_sentences(example):
     """Extract gold sentences from supporting_facts."""
-    context = example.get("context", [])
-    supporting_facts = example.get("supporting_facts", [])
+    context_raw = example.get("context", [])
+    supporting_facts_raw = example.get("supporting_facts", [])
     
     gold_sentences = []
-    for title, sent_idx in supporting_facts:
-        # Find the paragraph with this title
-        for para_title, sentences in context:
-            if para_title == title and sent_idx < len(sentences):
-                gold_sentences.append(sentences[sent_idx])
-                break
+    
+    # Normalize context format - handle dict format from hotpot_qa dataset
+    if isinstance(context_raw, dict):
+        # Format: {'title': [...], 'sentences': [[...], [...]]}
+        normalized_context = list(zip(context_raw['title'], context_raw['sentences']))
+    elif isinstance(context_raw, list):
+        # Already in list format
+        normalized_context = []
+        for item in context_raw:
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                title = item[0]
+                sentences = item[1]
+                # Ensure sentences is a list
+                if not isinstance(sentences, list):
+                    sentences = list(sentences) if hasattr(sentences, '__iter__') else [str(sentences)]
+                normalized_context.append((title, sentences))
+    else:
+        normalized_context = []
+    
+    # Normalize supporting_facts format - handle dict format from hotpot_qa dataset
+    if isinstance(supporting_facts_raw, dict):
+        # Format: {'title': [...], 'sent_id': [...]}
+        supporting_facts = list(zip(supporting_facts_raw['title'], supporting_facts_raw['sent_id']))
+    elif isinstance(supporting_facts_raw, list):
+        # Already in list format
+        supporting_facts = supporting_facts_raw
+    else:
+        supporting_facts = []
+    
+    # Process supporting facts
+    for sp in supporting_facts:
+        if isinstance(sp, (list, tuple)) and len(sp) >= 2:
+            title = sp[0]
+            sent_idx = sp[1]
+            
+            # Find the paragraph with this title
+            for para_title, sentences in normalized_context:
+                if para_title == title and sent_idx < len(sentences):
+                    gold_sentences.append(sentences[sent_idx])
+                    break
     
     return gold_sentences
 
@@ -105,8 +162,18 @@ for i in range(TRAIN_SAMPLE_SIZE):
     question = example["question"]
     gold_answer = example["answer"]
     gold_supporting_facts = example["supporting_facts"]
-    context = example["context"]
-    example_id = example["_id"]
+    context_raw = example["context"]
+    example_id = example["id"]
+    
+    # Normalize context format - handle dict format from hotpot_qa dataset
+    if isinstance(context_raw, dict):
+        # Format: {'title': [...], 'sentences': [[...], [...]]}
+        context = list(zip(context_raw['title'], context_raw['sentences']))
+    elif isinstance(context_raw, list):
+        # Already in list format
+        context = context_raw
+    else:
+        context = []
     
     if METHOD == "decomposition":
         # Run decomposition pipeline
@@ -114,16 +181,21 @@ for i in range(TRAIN_SAMPLE_SIZE):
         
         # Extract results
         answer = full_output["answer"]
-        subqueries = full_output["subqueries"]
-        retrieved_sentences = full_output["retrieved_sentences"]
+        subqueries = full_output["subqueries"]  # Dictionary mapping subquery -> retrieved sentences
         
         # Extract gold sentences
         gold_sentences = extract_gold_sentences(example)
         
-        # Calculate metrics
+        # Calculate metrics - get all retrieved sentences from subqueries for recall calculation
+        all_retrieved_sentences = []
+        for retrieved_sents in subqueries.values():
+            all_retrieved_sentences.extend(retrieved_sents)
+        # Deduplicate
+        all_retrieved_sentences = list(dict.fromkeys(all_retrieved_sentences))  # Preserves order while removing duplicates
+        
         f1 = f1_score(answer, gold_answer)
         correct = 1 if f1 > 0.5 else 0
-        recall = calculate_recall(retrieved_sentences, gold_sentences)
+        recall = calculate_recall(all_retrieved_sentences, gold_sentences)
         
         # Build result dict in specified order
         result = {
@@ -132,8 +204,7 @@ for i in range(TRAIN_SAMPLE_SIZE):
             "gold_answer": gold_answer,
             "correct": correct,
             "recall": recall,
-            "subqueries": subqueries,
-            "retrieved_sentences": retrieved_sentences,
+            "subqueries": subqueries,  # Dictionary: subquery -> list of retrieved sentences
             "gold_sentences": gold_sentences,
         }
         
@@ -142,11 +213,13 @@ for i in range(TRAIN_SAMPLE_SIZE):
         
         # Save periodically
         if (i + 1) % SAVE_FREQUENCY == 0:
-            with open(PREDICTIONS_PATH, 'w') as f:
+            with open(DATASET_PATH, 'w') as f:
                 json.dump(predictions, f, indent=2)
             print(f"Saved predictions after {i + 1} examples")
 
 # Save final predictions
-with open(PREDICTIONS_PATH, 'w') as f:
+with open(DATASET_PATH, 'w') as f:
     json.dump(predictions, f, indent=2)
-print(f"Final predictions saved to {PREDICTIONS_PATH}")
+print(f"Final predictions saved to {DATASET_PATH}")
+
+# %%
