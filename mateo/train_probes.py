@@ -22,6 +22,7 @@ from torch.utils.data import Dataset, DataLoader
 from typing import List, Dict, Any
 from tqdm import tqdm
 import numpy as np
+import string
 from transformer_lens import HookedTransformer
 from sklearn.metrics import roc_auc_score, accuracy_score, precision_score, recall_score, f1_score as sklearn_f1
 
@@ -35,10 +36,11 @@ JSON_DATASET_PATH = str(project_root / "mateo" / "training_datasets" / "decompos
 
 BATCH_SIZE = 32
 GRADIENT_ACCUMULATION_STEPS = 1
-NUM_EPOCHS = 1
-LEARNING_RATE = 1e-5
+NUM_EPOCHS = 30  # Increased from 3 - probes need more training
+LEARNING_RATE = 1e-4  # Increased from 1e-5 - was too low
 MAX_SEQ_LEN = 512
 SAVE_INTERVAL_WEIGHT_UPDATES = 1
+WEIGHT_DECAY = 0.0  # Set to 0 for initial sanity check, can increase later
 
 #%%
 # Helper Classes
@@ -164,8 +166,11 @@ class JSONDataset(Dataset):
         # Construct prompt (question + subqueries with context, without answer)
         prompt = f"Question: {question}\n\n{context_text}\n\nAnswer:"
         
-        # Construct full_text (prompt + answer)
-        full_text = f"{prompt} {answer}"
+        # Clean answer text to ensure final token is the answer token
+        cleaned_answer = clean_answer_text(answer)
+        
+        # Construct full_text (prompt + cleaned answer)
+        full_text = f"{prompt} {cleaned_answer}"
         
         # Determine label based on variation
         if self.variation == "recall_balanced":
@@ -188,17 +193,84 @@ def collate_fn(batch: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Custom collate function that just returns the list of dictionaries as-is."""
     return batch
 
-def get_answer_token_index(tokenizer, prompt: str, answer: str) -> int:
-    """Get the token index where the answer ends in the full text."""
-    full_text = prompt + " " + answer
-    prompt_tokens = tokenizer.encode(prompt, add_special_tokens=False)
-    full_tokens = tokenizer.encode(full_text, add_special_tokens=False)
+def clean_answer_text(text: str) -> str:
+    """Clean answer text by removing trailing punctuation and whitespace.
     
-    if len(full_tokens) <= len(prompt_tokens):
-        return len(prompt_tokens) - 1
+    This ensures the final token is the actual answer token, not punctuation.
     
-    answer_end_idx = len(full_tokens) - 1
-    return answer_end_idx
+    Args:
+        text: Raw answer text
+        
+    Returns:
+        Cleaned answer text
+    """
+    import re
+    # Remove trailing punctuation (except if the answer itself is punctuation)
+    text = text.rstrip()
+    # Remove trailing punctuation marks: . , ; : ! ? ) ] } " ' etc.
+    # But keep the text if it's just punctuation (like "yes" or "no")
+    text = re.sub(r'[.,;:!?)\]}"\']+$', '', text)
+    # Remove trailing whitespace again
+    text = text.rstrip()
+    return text
+
+def find_last_meaningful_token_indices(tokenizer, input_ids: torch.Tensor) -> torch.Tensor:
+    """Find the last meaningful (non-special, non-punctuation) token for each example.
+    
+    This walks backwards through each sequence to find the last token that is:
+    - Not a pad token
+    - Not a special token (like <eos>, <|endoftext|>, etc.)
+    - Not pure punctuation/whitespace
+    
+    This is more accurate than just using the last non-pad token, which might be EOS.
+    
+    Args:
+        tokenizer: The tokenizer to use for decoding
+        input_ids: [B, S] tensor of token IDs
+        
+    Returns:
+        [B] tensor of token indices
+    """
+    B, S = input_ids.shape
+    answer_indices = []
+    
+    for i in range(B):
+        ids = input_ids[i]
+        # Walk backwards to find last non-special, non-punc token
+        idx = S - 1
+        while idx >= 0:
+            # Check if pad token
+            if ids[idx].item() == tokenizer.pad_token_id:
+                idx -= 1
+                continue
+            
+            # Decode this token
+            tok = tokenizer.decode(ids[idx:idx+1])
+            
+            # Check if special token (starts and ends with < >)
+            is_special = tok.startswith("<") and tok.endswith(">")
+            
+            # Check if pure punctuation/whitespace
+            is_punc_or_space = all(c in string.punctuation + string.whitespace for c in tok)
+            
+            if not is_special and not is_punc_or_space:
+                break
+            
+            idx -= 1
+        
+        # Fallback to last non-pad token if nothing found
+        if idx < 0:
+            # Find last non-pad token
+            for j in range(S - 1, -1, -1):
+                if ids[j].item() != tokenizer.pad_token_id:
+                    idx = j
+                    break
+            if idx < 0:
+                idx = S - 1  # Ultimate fallback
+        
+        answer_indices.append(idx)
+    
+    return torch.tensor(answer_indices, device=input_ids.device)
 
 #%% 
 # Load Model
@@ -272,9 +344,13 @@ for probe_type in ['baseline', 'attention']:
                 # Get only the parameters for this layer's classifier
                 layer_params = list(probes[key].classifiers[layer_idx].parameters())
             else:
-                # Get only the parameters for this layer (q and v vectors)
-                layer_params = [probes[key].q_vectors[layer_idx], probes[key].v_vectors[layer_idx]]
-            optimizers[layer_key] = torch.optim.Adam(layer_params, lr=LEARNING_RATE)
+                # Get only the parameters for this layer (q and v vectors, plus bias)
+                layer_params = [
+                    probes[key].q_vectors[layer_idx], 
+                    probes[key].v_vectors[layer_idx],
+                    probes[key].biases[layer_idx]
+                ]
+            optimizers[layer_key] = torch.optim.AdamW(layer_params, lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
 if os.path.exists(checkpoint_path):
     print(f"Found checkpoint at {checkpoint_path}, loading...")
@@ -297,13 +373,6 @@ if os.path.exists(checkpoint_path):
                 opt_key = f"{layer_key}_optimizer_state"
                 if opt_key in checkpoint:
                     optimizers[layer_key].load_state_dict(checkpoint[opt_key])
-    
-    # Backward compatibility: load old single probe format
-    if 'baseline_probe_state' in checkpoint and 'answer_balanced' not in str(checkpoint.keys()):
-        print("Loading old checkpoint format, converting to new format...")
-        probes['baseline_answer_balanced'].load_state_dict(checkpoint['baseline_probe_state'])
-        probes['attention_answer_balanced'].load_state_dict(checkpoint['attention_probe_state'])
-        # For old format, we can't load layer-specific optimizers, so they'll start fresh
     
     print(f"Resuming from epoch {start_epoch + 1}, batch {start_batch + 1}")
 else:
@@ -446,7 +515,6 @@ if __name__ == "__main__":
                 # Extract full texts and labels from pre-generated dataset
                 batch_full_texts = []
                 batch_labels = []
-                batch_answer_indices = []
                 
                 for ex in batch:
                     full_text = ex['full_text']
@@ -454,35 +522,36 @@ if __name__ == "__main__":
                     
                     batch_full_texts.append(full_text)
                     batch_labels.append(label)
-                    
-                    # Extract prompt and answer to find answer token index
-                    prompt = ex.get('prompt', '')
-                    answer = ex.get('answer', '')
-                    
-                    if not prompt and answer:
-                        if answer in full_text:
-                            prompt = full_text[:full_text.rfind(answer)].strip()
-                        else:
-                            prompt = full_text
-                    
-                    if prompt and answer:
-                        answer_idx = get_answer_token_index(tokenizer, prompt, answer)
-                    else:
-                        tokens = tokenizer.encode(full_text, add_special_tokens=False)
-                        answer_idx = len(tokens) - 1
-                    
-                    batch_answer_indices.append(answer_idx)
                 
                 batch_labels = torch.tensor(batch_labels, dtype=torch.float32).to(model.cfg.device)
                 
-                # Tokenize full texts
+                # Tokenize full texts with explicit special tokens (default is True)
                 tokenized = tokenizer(
                     batch_full_texts,
                     return_tensors="pt",
                     padding=True,
                     truncation=True,
                     max_length=MAX_SEQ_LEN,
+                    add_special_tokens=True,  # Explicit - matches what model sees
                 ).to(model.cfg.device)
+                
+                # Find last meaningful token (not EOS, not punctuation) for each example
+                # This is more accurate than just using the last non-pad token
+                attn_mask = tokenized.attention_mask
+                answer_indices = find_last_meaningful_token_indices(tokenizer, tokenized.input_ids)
+                
+                # Log truncation statistics and sanity check probed tokens (first batch only)
+                if batch_idx == 0 and epoch == start_epoch:
+                    lengths = attn_mask.sum(dim=1).cpu().numpy()
+                    truncated_count = (lengths == MAX_SEQ_LEN).sum()
+                    print(f"  Batch {batch_idx}: Max length={lengths.max()}, "
+                          f"Mean length={lengths.mean():.1f}, "
+                          f"Truncated examples={truncated_count}/{len(lengths)}")
+                    # Sanity check: print a few probed tokens
+                    print("  Sanity check - probed tokens (first 3 examples):")
+                    for i in range(min(3, len(answer_indices))):
+                        probed_token = tokenizer.decode(tokenized.input_ids[i, answer_indices[i]:answer_indices[i]+1])
+                        print(f"    Example {i}: '{probed_token}' (idx {answer_indices[i].item()})")
                 
                 del batch_full_texts
                 
@@ -514,8 +583,7 @@ if __name__ == "__main__":
                 
                 hidden_states_for_probes = hidden_states.float()
                 
-                answer_indices = torch.tensor(batch_answer_indices, device=model.cfg.device)
-                
+                # answer_indices already computed from attention mask above
                 batch_size_actual = hidden_states_for_probes.shape[0]
                 seq_len_actual = hidden_states_for_probes.shape[2]
                 
@@ -523,6 +591,7 @@ if __name__ == "__main__":
                     batch_labels = batch_labels[:batch_size_actual]
                     answer_indices = answer_indices[:batch_size_actual]
                 
+                # Clamp answer indices to valid range (shouldn't be needed with attention mask method, but safety check)
                 answer_indices = torch.clamp(answer_indices, 0, seq_len_actual - 1)
                 
                 # Train each layer-probe combination independently
@@ -534,7 +603,8 @@ if __name__ == "__main__":
                     if probe_type == 'baseline':
                         logits = probe(hidden_states_for_probes, answer_indices)
                     else:
-                        logits = probe(hidden_states_for_probes)
+                        # Pass attention mask to attention probe for proper pad token masking
+                        logits = probe(hidden_states_for_probes, attn_mask=attn_mask)
                     
                     # Train each layer independently
                     for layer_idx in range(num_layers):
@@ -657,7 +727,6 @@ if __name__ == "__main__":
                 for batch in tqdm(val_loader, desc=f"Validating {variation}"):
                     batch_full_texts = []
                     batch_labels = []
-                    batch_answer_indices = []
                     
                     for ex in batch:
                         full_text = ex['full_text']
@@ -665,33 +734,26 @@ if __name__ == "__main__":
                         
                         batch_full_texts.append(full_text)
                         batch_labels.append(label)
-                        
-                        prompt = ex.get('prompt', '')
-                        answer = ex.get('answer', '')
-                        
-                        if not prompt and answer:
-                            if answer in full_text:
-                                prompt = full_text[:full_text.rfind(answer)].strip()
-                            else:
-                                prompt = full_text
-                        
-                        if prompt and answer:
-                            answer_idx = get_answer_token_index(tokenizer, prompt, answer)
-                        else:
-                            tokens = tokenizer.encode(full_text, add_special_tokens=False)
-                            answer_idx = len(tokens) - 1
-                        
-                        batch_answer_indices.append(answer_idx)
                     
                     batch_labels = torch.tensor(batch_labels, dtype=torch.float32).to(model.cfg.device)
                     
+                    # Tokenize full texts with explicit special tokens (default is True)
                     tokenized = tokenizer(
                         batch_full_texts,
                         return_tensors="pt",
                         padding=True,
                         truncation=True,
                         max_length=MAX_SEQ_LEN,
+                        add_special_tokens=True,  # Explicit - matches what model sees
                     ).to(model.cfg.device)
+                    
+                    # Find last meaningful token (not EOS, not punctuation) for each example
+                    # This is more accurate than just using the last non-pad token
+                    attn_mask = tokenized.attention_mask
+                    answer_indices = find_last_meaningful_token_indices(tokenizer, tokenized.input_ids)
+                    
+                    # Store attn_mask for attention probe (needs to be passed through)
+                    attn_mask_for_probe = attn_mask
                     
                     del batch_full_texts
                     
@@ -720,8 +782,7 @@ if __name__ == "__main__":
                     
                     hidden_states_for_probes = hidden_states.float()
                     
-                    answer_indices = torch.tensor(batch_answer_indices, device=model.cfg.device)
-                    
+                    # answer_indices already computed from attention mask above
                     batch_size_actual = hidden_states_for_probes.shape[0]
                     seq_len_actual = hidden_states_for_probes.shape[2]
                     
@@ -729,6 +790,7 @@ if __name__ == "__main__":
                         batch_labels = batch_labels[:batch_size_actual]
                         answer_indices = answer_indices[:batch_size_actual]
                     
+                    # Clamp answer indices to valid range (shouldn't be needed with attention mask method, but safety check)
                     answer_indices = torch.clamp(answer_indices, 0, seq_len_actual - 1)
                     
                     # Validate each layer-probe combination independently
@@ -740,7 +802,8 @@ if __name__ == "__main__":
                         if probe_type == 'baseline':
                             logits = probe(hidden_states_for_probes, answer_indices)
                         else:
-                            logits = probe(hidden_states_for_probes)
+                            # Pass attention mask to attention probe for proper pad token masking
+                            logits = probe(hidden_states_for_probes, attn_mask=attn_mask)
                         
                         # Evaluate each layer independently
                         for layer_idx in range(num_layers):
