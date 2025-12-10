@@ -1,12 +1,11 @@
 """
-Lightweight probes for Llama hidden states and uncertainty features.
+Lightweight probes for Llama hidden states.
 
 This module defines:
 - ProbeConfig: configuration dataclass for probes.
 - BaseProbe: abstract base class.
 - DenseLinearProbe: linear probe on hidden states (optionally L1-sparse).
 - MassMeanProbe: "mass-mean direction" probe with 1D logistic calibration.
-- UncertaintyProbe: linear probe on low-dimensional uncertainty features.
 
 All probes are designed to be fast to train on relatively small datasets
 (<= ~10k examples) and moderate-dimensional inputs (e.g. residual stream).
@@ -38,16 +37,14 @@ class ProbeConfig:
     Attributes
     ----------
     probe_type:
-        One of {"dense_linear", "mass_mean", "uncertainty"}.
+        One of {"dense_linear", "mass_mean"}.
     layer:
         Layer index this probe is associated with (if applicable).
-        Can be None for layer-agnostic probes (e.g. uncertainty).
     task_name:
         Name of the target task, e.g. "correct", "correct_given_recall1",
         or "recall_full".
     feature_names:
-        Optional list of names for each input feature (e.g. for uncertainty
-        features). Purely metadata.
+        Optional list of names for each input feature. Purely metadata.
     use_l1:
         Whether to use L1 regularization on the weights (for dense linear probes).
     l1_lambda:
@@ -168,7 +165,7 @@ def load_probe(path: str) -> BaseProbe:
     Returns
     -------
     probe:
-        An instance of DenseLinearProbe, MassMeanProbe, or UncertaintyProbe.
+        An instance of DenseLinearProbe or MassMeanProbe.
     """
     payload = torch.load(path, map_location="cpu")
     probe_type = payload["probe_type"]
@@ -180,8 +177,6 @@ def load_probe(path: str) -> BaseProbe:
         probe: BaseProbe = DenseLinearProbe(config)
     elif probe_type == "mass_mean":
         probe = MassMeanProbe(config)
-    elif probe_type == "uncertainty":
-        probe = UncertaintyProbe(config)
     else:
         raise ValueError(f"Unknown probe_type in saved file: {probe_type}")
 
@@ -204,9 +199,7 @@ class DenseLinearProbe(BaseProbe):
     """
 
     def __init__(self, config: ProbeConfig):
-        # Allow DenseLinearProbe to also serve as base for UncertaintyProbe
-        # without clobbering its probe_type.
-        if config.probe_type not in {"dense_linear", "uncertainty"}:
+        if config.probe_type != "dense_linear":
             config.probe_type = "dense_linear"
         super().__init__(config)
         self.linear: Optional[nn.Linear] = None
@@ -554,30 +547,10 @@ class MassMeanProbe(BaseProbe):
         self.beta = state["beta"].float().cpu()
 
 
-# -------------------------
-#  Uncertainty feature probe
-# -------------------------
-
-
-class UncertaintyProbe(DenseLinearProbe):
-    """Probe on low-dimensional uncertainty features.
-
-    Architecturally identical to DenseLinearProbe (linear + sigmoid),
-    but conceptually meant for scalar features like entropy, max prob, etc.
-
-    The training/evaluation API is identical to DenseLinearProbe.
-    """
-
-    def __init__(self, config: ProbeConfig):
-        config.probe_type = "uncertainty"
-        super().__init__(config)
-
-
 __all__ = [
     "ProbeConfig",
     "BaseProbe",
     "DenseLinearProbe",
     "MassMeanProbe",
-    "UncertaintyProbe",
     "load_probe",
 ]

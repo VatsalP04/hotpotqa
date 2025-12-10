@@ -5,7 +5,7 @@ Script to train lightweight probes on Llama-3.1-8B activations for the
 HotpotQA decomposition dataset.
 
 Usage:
-    python -m mateo.train_probes [mode] [--balance] [--include-retrieval]
+    python -m mateo.train_probes [mode] [--balance]
 
 Arguments
 ---------
@@ -15,14 +15,8 @@ mode : {"full", "test"}, optional
       everything runs without errors.
 
 --balance : flag, optional
-    If set, downsamples training data to balance class distributions.
-    - For "correct" tasks: balances answer distribution (correct vs incorrect).
-    - For "recall_full" task: balances recall distribution (recall=1.0 vs recall<1.0).
-
---include-retrieval : flag, optional
-    If set, includes retrieved context sentences after each subquery in the input context.
-    Format: "Question + Subquery 1 + Retrieved context 1 + ... + Subquery i + 
-    Retrieved context i + Answer". Default is to exclude retrieval contexts.
+    Deprecated: class balancing is now always applied to the training set.
+    This flag is kept for backwards compatibility but has no effect.
 
 Expected runtime on an A100 80GB (rough ballpark):
     - full: ~1–3 minutes with defaults (3k examples, 8 layers, 3 epochs).
@@ -34,17 +28,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
 from transformer_lens import HookedTransformer
+from collections import defaultdict
 
 from mateo.probes import (
     ProbeConfig,
     DenseLinearProbe,
     MassMeanProbe,
-    UncertaintyProbe,
 )
 
 
@@ -56,23 +50,18 @@ JSON_DATASET_PATH = os.path.join(
 
 def load_hotpot_decomp_dataset(
     json_path: str,
-    include_retrieval: bool = False,
-) -> Tuple[List[str], np.ndarray, np.ndarray]:
+) -> Tuple[Dict[str, List[str]], np.ndarray, np.ndarray]:
     """Load dataset and build context strings + labels.
 
     Parameters
     ----------
     json_path : str
         Path to the JSON dataset file.
-    include_retrieval : bool, default=False
-        If True, include retrieved context sentences after each subquery.
-        Format: "Question + Subquery 1 + Retrieved context 1 + ... + Subquery i + Retrieved context i + Answer"
-        If False, format: "Question + Subquery 1 + ... + Subquery i + Answer"
 
     Returns
     -------
-    contexts : list of str
-        Each is "Question + Subquery 1 + ... + Subquery n + Answer" (or with retrieval contexts if enabled).
+    contexts : dict
+        Keys are "planning", "subanswer", "final". Values are lists of context strings.
     y_correct : np.ndarray, shape (N,)
         0/1 labels for answer correctness.
     y_recall_full : np.ndarray, shape (N,)
@@ -84,41 +73,50 @@ def load_hotpot_decomp_dataset(
     with open(json_path, "r", encoding="utf-8") as f:
         data = json.load(f)
 
-    contexts: List[str] = []
+    contexts_planning: List[str] = []
+    contexts_subanswer: List[str] = []
+    contexts_final: List[str] = []
     correct_labels: List[int] = []
     recall_full_labels: List[int] = []
 
     for qid, entry in data.items():
-        question = entry.get("question", "").strip()
-        answer = str(entry.get("answer", "")).strip()
-
         correct = int(entry.get("correct", 0))
         recall = float(entry.get("recall", 0.0))
         recall_full = 1 if abs(recall - 1.0) < 1e-8 else 0
 
-        subqueries = entry.get("subqueries", {})
-        # Sort subqueries by key for a deterministic order.
-        sq_items = sorted(subqueries.items(), key=lambda kv: kv[0])
+        planning = entry.get("planning", "").strip()
+        subanswer_list = entry.get("subanswer", [])
+        final = entry.get("final", "").strip()
 
-        parts: List[str] = []
-        parts.append(f"Question: {question}\n")
-        for i, (sq_text, sq_evidence) in enumerate(sq_items):
-            sq_text_clean = sq_text.strip()
-            parts.append(f"Subquery {i+1}: {sq_text_clean}\n")
-            
-            if include_retrieval and sq_evidence:
-                # sq_evidence is a list of retrieved sentences
-                retrieved_text = " ".join(str(s).strip() for s in sq_evidence if s)
-                if retrieved_text:
-                    parts.append(f"Retrieved context {i+1}: {retrieved_text}\n")
-        
-        parts.append(f"Answer: {answer}")
-        context = "".join(parts)
+        # Trim <|eot_id|> if it exists at the end
+        if planning.endswith("<|eot_id|>"):
+            planning = planning[:-10].rstrip()
+        if final.endswith("<|eot_id|>"):
+            final = final[:-10].rstrip()
 
-        contexts.append(context)
+        # For planning and final, use the text directly
+        contexts_planning.append(planning)
+        contexts_final.append(final)
+
+        # For subanswer, concatenate all subanswers and trim <|eot_id|>
+        subanswer_parts = []
+        for sa in subanswer_list:
+            sa_text = str(sa).strip()
+            if sa_text.endswith("<|eot_id|>"):
+                sa_text = sa_text[:-10].rstrip()
+            if sa_text:
+                subanswer_parts.append(sa_text)
+        subanswer_text = "\n\n".join(subanswer_parts)
+        contexts_subanswer.append(subanswer_text)
+
         correct_labels.append(correct)
         recall_full_labels.append(recall_full)
 
+    contexts = {
+        "planning": contexts_planning,
+        "subanswer": contexts_subanswer,
+        "final": contexts_final,
+    }
     y_correct = np.array(correct_labels, dtype=np.float32)
     y_recall_full = np.array(recall_full_labels, dtype=np.float32)
 
@@ -143,13 +141,13 @@ def make_splits(
     return train_idx, val_idx, test_idx
 
 
-def compute_activations_and_uncertainty(
+def compute_activations(
     model: "HookedTransformer",
     contexts: List[str],
     layers_to_probe: List[int],
     full_run: bool,
-) -> Tuple[Dict[int, np.ndarray], np.ndarray]:
-    """Compute hidden activations and uncertainty features.
+) -> Dict[int, np.ndarray]:
+    """Compute hidden activations.
 
     Parameters
     ----------
@@ -166,8 +164,6 @@ def compute_activations_and_uncertainty(
     -------
     hidden_per_layer : dict
         layer -> np.ndarray of shape (N, d_model).
-    uncertainty_feats : np.ndarray
-        Shape (N, 4) with [p_max, margin, entropy, hidden_norm_final].
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -183,22 +179,15 @@ def compute_activations_and_uncertainty(
 
     n_examples = len(contexts)
     d_model = model.cfg.d_model
-    n_layers = model.cfg.n_layers
-    last_layer = n_layers - 1
 
     # Preallocate storage on CPU.
     hidden_per_layer: Dict[int, np.ndarray] = {
         layer: np.empty((n_examples, d_model), dtype=np.float32)
         for layer in layers_to_probe
     }
-    n_uncertainty_features = 4  # [p_max, margin, entropy, hidden_norm]
-    uncertainty_feats = np.empty((n_examples, n_uncertainty_features), dtype=np.float32)
 
     # Hook names
     hook_names = [f"blocks.{layer}.hook_resid_post" for layer in layers_to_probe]
-    hook_last_name = f"blocks.{last_layer}.hook_resid_post"
-    if hook_last_name not in hook_names:
-        hook_names.append(hook_last_name)
 
     def names_filter(name: str) -> bool:
         return name in hook_names
@@ -239,7 +228,7 @@ def compute_activations_and_uncertainty(
             positions = batch_lengths - 1  # final token index per example
             batch_indices = torch.arange(bsz, device=device)
 
-            # Hidden states per layer
+            # Hidden states per layer (final token)
             for layer in layers_to_probe:
                 hook_name = f"blocks.{layer}.hook_resid_post"
                 acts = cache[hook_name]  # (bsz, max_len, d_model)
@@ -248,28 +237,6 @@ def compute_activations_and_uncertainty(
                     final_acts.float().cpu().numpy()
                 )
 
-            # Uncertainty features from final token logits + final layer norm.
-            # Cast to float32 to avoid half-precision underflow in softmax/log.
-            logits_last = logits[batch_indices, positions, :].float()  # (bsz, d_vocab)
-            probs = torch.softmax(logits_last, dim=-1)  # float32
-
-            p_max, _ = probs.max(dim=-1)  # (bsz,)
-            top2, _ = probs.topk(2, dim=-1)
-            margin = top2[:, 0] - top2[:, 1]
-
-            probs_clamped = probs.clamp_min(1e-12)
-            entropy = -(probs_clamped * probs_clamped.log()).sum(dim=-1)
-
-            h_last = cache[hook_last_name][batch_indices, positions, :].float()
-            hidden_norm = h_last.norm(dim=-1)
-
-            # Safety: replace any NaN/inf that might still sneak through.
-            entropy = torch.nan_to_num(entropy, nan=0.0, posinf=0.0, neginf=0.0)
-            hidden_norm = torch.nan_to_num(hidden_norm, nan=0.0, posinf=1e3, neginf=-1e3)
-
-            feats = torch.stack([p_max, margin, entropy, hidden_norm], dim=-1)
-            uncertainty_feats[start:end, :] = feats.float().cpu().numpy()
-
             start = end
 
             # Free batch cache/logits
@@ -277,18 +244,53 @@ def compute_activations_and_uncertainty(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-    # Final safety on the full array
-    uncertainty_feats = np.nan_to_num(
-        uncertainty_feats, nan=0.0, posinf=1e3, neginf=-1e3
-    )
-
-    return hidden_per_layer, uncertainty_feats
+    return hidden_per_layer
 
 
 def has_both_classes(y: np.ndarray) -> bool:
     """Return True if y contains both 0 and 1."""
     uniq = np.unique(y)
     return len(uniq) >= 2 and (0.0 in uniq) and (1.0 in uniq)
+
+
+def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float, float]:
+    """Calculate accuracy, precision, recall, and F1 for binary classification.
+    
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True binary labels (0 or 1).
+    y_pred : np.ndarray
+        Predicted binary labels (0 or 1).
+    
+    Returns
+    -------
+    accuracy : float
+        Accuracy score.
+    precision : float
+        Precision score (TP / (TP + FP)).
+    recall : float
+        Recall score (TP / (TP + FN)).
+    f1 : float
+        F1 score (2 * precision * recall / (precision + recall)).
+    """
+    accuracy = float((y_pred == y_true).mean())
+    
+    # Calculate TP, FP, FN, TN
+    tp = float(((y_pred == 1) & (y_true == 1)).sum())
+    fp = float(((y_pred == 1) & (y_true == 0)).sum())
+    fn = float(((y_pred == 0) & (y_true == 1)).sum())
+    
+    # Precision: TP / (TP + FP)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    
+    # Recall: TP / (TP + FN)
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    
+    # F1: 2 * precision * recall / (precision + recall)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+    
+    return accuracy, precision, recall, f1
 
 
 def downsample_balanced(
@@ -312,20 +314,20 @@ def downsample_balanced(
     """
     if len(indices) == 0:
         return indices
-    
+
     # Get labels for the given indices
     idx_labels = labels[indices]
-    
+
     # Find indices for each class
     class_0_mask = idx_labels == 0.0
     class_1_mask = idx_labels == 1.0
-    
+
     class_0_indices = indices[class_0_mask]
     class_1_indices = indices[class_1_mask]
-    
+
     n_class_0 = len(class_0_indices)
     n_class_1 = len(class_1_indices)
-    
+
     # If both classes exist, downsample to the smaller class size
     if n_class_0 > 0 and n_class_1 > 0:
         min_size = min(n_class_0, n_class_1)
@@ -343,7 +345,6 @@ def downsample_balanced(
 
 def train_all_probes(
     hidden_per_layer: Dict[int, np.ndarray],
-    uncertainty_feats: np.ndarray,
     y_correct: np.ndarray,
     y_recall_full: np.ndarray,
     train_idx: np.ndarray,
@@ -352,23 +353,32 @@ def train_all_probes(
     layers_to_probe: List[int],
     full_run: bool,
     balance: bool = False,
-    rng: np.random.Generator | None = None,
+    rng: Optional[np.random.Generator] = None,
+    context_type: str = "planning",
 ) -> None:
-    """Train DenseLinear, MassMean, and Uncertainty probes on all tasks.
+    """Train DenseLinear and MassMean probes on all tasks.
     
     Parameters
     ----------
     balance : bool, default=False
-        If True, downsample training data to balance class distributions.
-        For "correct" tasks, balances based on y_correct.
-        For "recall_full" task, balances based on y_recall_full.
+        Deprecated: class balancing is now always applied to the training set.
+        This parameter is kept for backwards compatibility but has no effect.
     rng : np.random.Generator, optional
-        Random number generator for downsampling. Required if balance=True.
+        Random number generator for downsampling. Required for class balancing.
+    context_type : str, default="planning"
+        Type of context: "planning", "subanswer", or "final".
+    
+    Note
+    ----
+    Class balancing is always applied to the training set (not val/test):
+    - For "correct" and "correct_given_recall1" tasks: balances based on y_correct.
+    - For "recall_full" task: balances based on y_recall_full.
+    - The "correct_given_recall1" task only filters to recall=1.0 for the TRAINING set.
     """
     os.makedirs("trained_probes", exist_ok=True)
-    
-    if balance and rng is None:
-        raise ValueError("rng must be provided when balance=True")
+
+    if rng is None:
+        raise ValueError("rng must be provided for class balancing")
 
     n = y_correct.shape[0]
     train_mask = np.zeros(n, dtype=bool)
@@ -388,20 +398,26 @@ def train_all_probes(
 
     num_epochs_dense = 3 if full_run else 1
     num_epochs_mass = 50 if full_run else 10
-    num_epochs_uncertainty = 3 if full_run else 1
 
     results: List[Dict[str, object]] = []
 
     # ---- DenseLinearProbe per layer ----
     print("\n=== Training DenseLinearProbes ===")
     for task_name, y_all, extra_mask in tasks:
-        base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
         for layer in layers_to_probe:
             X = hidden_per_layer[layer]
 
-            train_m = base_mask & train_mask
-            val_m = base_mask & val_mask
-            test_m = base_mask & test_mask
+            # For correct_given_recall1, only filter training set to recall=1
+            # Val and test sets use all examples
+            if task_name == "correct_given_recall1" and extra_mask is not None:
+                train_m = extra_mask & train_mask
+                val_m = val_mask  # Use all val examples
+                test_m = test_mask  # Use all test examples
+            else:
+                base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
+                train_m = base_mask & train_mask
+                val_m = base_mask & val_mask
+                test_m = base_mask & test_mask
 
             if train_m.sum() < 2:
                 print(
@@ -410,8 +426,8 @@ def train_all_probes(
                 )
                 continue
 
-            # Apply downsampling if balance is enabled
-            if balance and rng is not None:
+            # Always apply class balancing to training set (not val/test)
+            if rng is not None:
                 train_indices = np.where(train_m)[0]
                 # For "correct" tasks, balance based on y_correct
                 # For "recall_full" task, balance based on y_recall_full
@@ -425,12 +441,12 @@ def train_all_probes(
                     )
                 else:
                     balanced_train_indices = train_indices
-                
+
                 # Update train_m to only include balanced indices
                 train_m_balanced = np.zeros(n, dtype=bool)
                 train_m_balanced[balanced_train_indices] = True
                 train_m = train_m_balanced
-                
+
                 if train_m.sum() < 2:
                     print(
                         f"[Dense] Skipping layer {layer}, task {task_name}: "
@@ -463,50 +479,63 @@ def train_all_probes(
             )
 
             test_acc = float("nan")
+            test_precision = float("nan")
+            test_recall = float("nan")
+            test_f1 = float("nan")
             if test_m.sum() > 0:
                 X_test, y_test = X[test_m], y_all[test_m]
                 probs = probe.predict_proba(X_test)
                 preds = (probs >= 0.5).astype(np.float32)
-                test_acc = float((preds == y_test).mean())
+                test_acc, test_precision, test_recall, test_f1 = calculate_metrics(y_test, preds)
 
             print(
                 f"[Dense] Task={task_name:>20} | layer={layer:2d} | "
                 f"train_loss={metrics.get('train_loss', float('nan')):.4f} | "
-                f"test_acc={test_acc:.3f}"
+                f"test_acc={test_acc:.3f} | test_prec={test_precision:.3f} | "
+                f"test_rec={test_recall:.3f} | test_f1={test_f1:.3f}"
             )
 
             probe_path = os.path.join(
-                "trained_probes", f"dense_layer{layer}_{task_name}.pt"
+                "trained_probes", f"dense_layer{layer}_{context_type}_{task_name}.pt"
             )
             probe.save(probe_path)
 
             results.append(
                 {
                     "probe_type": "dense_linear",
+                    "context_type": context_type,
                     "task": task_name,
                     "layer": layer,
                     "train_loss": float(metrics.get("train_loss", float("nan"))),
                     "val_loss": float(metrics.get("val_loss", float("nan"))),
                     "test_acc": test_acc,
+                    "test_precision": test_precision,
+                    "test_recall": test_recall,
+                    "test_f1": test_f1,
                 }
             )
 
     # ---- MassMeanProbe per layer ----
     print("\n=== Training MassMeanProbes ===")
     for task_name, y_all, extra_mask in tasks:
-        base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
         for layer in layers_to_probe:
             X = hidden_per_layer[layer]
 
-            train_m = base_mask & train_mask
-            val_m = base_mask & val_mask
-            test_m = base_mask & test_mask
+            # For correct_given_recall1, only filter training set to recall=1
+            # Val and test sets use all examples
+            if task_name == "correct_given_recall1" and extra_mask is not None:
+                train_m = extra_mask & train_mask
+                val_m = val_mask  # Use all val examples
+                test_m = test_mask  # Use all test examples
+            else:
+                base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
+                train_m = base_mask & train_mask
+                val_m = base_mask & val_mask
+                test_m = base_mask & test_mask
 
-            # Apply downsampling if balance is enabled
-            if balance and rng is not None:
+            # Always apply class balancing to training set (not val/test)
+            if rng is not None:
                 train_indices = np.where(train_m)[0]
-                # For "correct" tasks, balance based on y_correct
-                # For "recall_full" task, balance based on y_recall_full
                 if task_name in ("correct", "correct_given_recall1"):
                     balanced_train_indices = downsample_balanced(
                         train_indices, y_correct, rng
@@ -517,8 +546,7 @@ def train_all_probes(
                     )
                 else:
                     balanced_train_indices = train_indices
-                
-                # Update train_m to only include balanced indices
+
                 train_m_balanced = np.zeros(n, dtype=bool)
                 train_m_balanced[balanced_train_indices] = True
                 train_m = train_m_balanced
@@ -558,149 +586,191 @@ def train_all_probes(
                 continue
 
             test_acc = float("nan")
+            test_precision = float("nan")
+            test_recall = float("nan")
+            test_f1 = float("nan")
             if test_m.sum() > 0:
                 X_test, y_test = X[test_m], y_all[test_m]
                 probs = probe.predict_proba(X_test)
                 preds = (probs >= 0.5).astype(np.float32)
-                test_acc = float((preds == y_test).mean())
+                test_acc, test_precision, test_recall, test_f1 = calculate_metrics(y_test, preds)
 
             print(
                 f"[MassMean] Task={task_name:>20} | layer={layer:2d} | "
                 f"train_loss={metrics.get('train_loss', float('nan')):.4f} | "
-                f"test_acc={test_acc:.3f}"
+                f"test_acc={test_acc:.3f} | test_prec={test_precision:.3f} | "
+                f"test_rec={test_recall:.3f} | test_f1={test_f1:.3f}"
             )
 
             probe_path = os.path.join(
-                "trained_probes", f"massmean_layer{layer}_{task_name}.pt"
+                "trained_probes", f"massmean_layer{layer}_{context_type}_{task_name}.pt"
             )
             probe.save(probe_path)
 
             results.append(
                 {
                     "probe_type": "mass_mean",
+                    "context_type": context_type,
                     "task": task_name,
                     "layer": layer,
                     "train_loss": float(metrics.get("train_loss", float("nan"))),
                     "val_loss": float(metrics.get("val_loss", float("nan"))),
                     "test_acc": test_acc,
+                    "test_precision": test_precision,
+                    "test_recall": test_recall,
+                    "test_f1": test_f1,
                 }
             )
 
-    # ---- UncertaintyProbe (layer-agnostic) ----
-    print("\n=== Training UncertaintyProbes ===")
-    X_all = uncertainty_feats
-    for task_name, y_all, extra_mask in tasks:
-        base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
-
-        train_m = base_mask & train_mask
-        val_m = base_mask & val_mask
-        test_m = base_mask & test_mask
-
-        if train_m.sum() < 2:
-            print(
-                f"[Uncertainty] Skipping task {task_name}: "
-                f"not enough training examples ({train_m.sum()})."
-            )
-            continue
-
-        # Apply downsampling if balance is enabled
-        if balance and rng is not None:
-            train_indices = np.where(train_m)[0]
-            # For "correct" tasks, balance based on y_correct
-            # For "recall_full" task, balance based on y_recall_full
-            if task_name in ("correct", "correct_given_recall1"):
-                balanced_train_indices = downsample_balanced(
-                    train_indices, y_correct, rng
-                )
-            elif task_name == "recall_full":
-                balanced_train_indices = downsample_balanced(
-                    train_indices, y_recall_full, rng
-                )
-            else:
-                balanced_train_indices = train_indices
-            
-            # Update train_m to only include balanced indices
-            train_m_balanced = np.zeros(n, dtype=bool)
-            train_m_balanced[balanced_train_indices] = True
-            train_m = train_m_balanced
-            
-            if train_m.sum() < 2:
-                print(
-                    f"[Uncertainty] Skipping task {task_name}: "
-                    f"not enough training examples after balancing ({train_m.sum()})."
-                )
-                continue
-
-        X_train, y_train = X_all[train_m], y_all[train_m]
-        X_val, y_val = (X_all[val_m], y_all[val_m]) if val_m.sum() > 0 else (None, None)
-
-        cfg = ProbeConfig(
-            probe_type="uncertainty",
-            layer=None,
-            task_name=task_name,
-            feature_names=["p_max", "margin", "entropy", "hidden_norm"],
-        )
-        probe = UncertaintyProbe(cfg)
-        metrics = probe.fit(
-            X_train,
-            y_train,
-            val_x=X_val,
-            val_y=y_val,
-            num_epochs=num_epochs_uncertainty,
-            lr=1e-2,
-            weight_decay=0.0,
-            batch_size=64,
-            device=None,
-            verbose=False,
-        )
-
-        test_acc = float("nan")
-        if test_m.sum() > 0:
-            X_test, y_test = X_all[test_m], y_all[test_m]
-            probs = probe.predict_proba(X_test)
-            preds = (probs >= 0.5).astype(np.float32)
-            test_acc = float((preds == y_test).mean())
-
-        print(
-            f"[Uncertainty] Task={task_name:>20} | "
-            f"train_loss={metrics.get('train_loss', float('nan')):.4f} | "
-            f"test_acc={test_acc:.3f}"
-        )
-
-        probe_path = os.path.join(
-            "trained_probes", f"uncertainty_{task_name}.pt"
-        )
-        probe.save(probe_path)
-
-        results.append(
-            {
-                "probe_type": "uncertainty",
-                "task": task_name,
-                "layer": None,
-                "train_loss": float(metrics.get("train_loss", float("nan"))),
-                "val_loss": float(metrics.get("val_loss", float("nan"))),
-                "test_acc": test_acc,
-            }
-        )
-
     # Save summary CSV
-    csv_path = os.path.join("trained_probes", "probe_results_summary.csv")
+    csv_path = os.path.join("trained_probes", f"probe_results_summary_{context_type}.csv")
     with open(csv_path, "w", encoding="utf-8") as f:
-        header = ["probe_type", "task", "layer", "train_loss", "val_loss", "test_acc"]
+        header = ["probe_type", "context_type", "task", "layer", "train_loss", "val_loss", 
+                  "test_acc", "test_precision", "test_recall", "test_f1"]
         f.write(",".join(header) + "\n")
         for row in results:
             f.write(
-                f"{row['probe_type']},{row['task']},{row['layer']},"
-                f"{row['train_loss']},{row['val_loss']},{row['test_acc']}\n"
+                f"{row['probe_type']},{row['context_type']},{row['task']},{row['layer']},"
+                f"{row['train_loss']},{row['val_loss']},{row['test_acc']},"
+                f"{row['test_precision']},{row['test_recall']},{row['test_f1']}\n"
             )
     print(f"\nSaved probe summary to {csv_path}")
+    
+    return results
 
 
-def main(mode: str, balance: bool = False, include_retrieval: bool = False) -> None:
+def print_best_probes(all_results: List[Dict[str, object]]) -> None:
+    """Print the best probes for each context type and task category.
+    
+    For each context type (planning, subanswer, final):
+    - Find best probe for answer prediction (correct or correct_given_recall1)
+    - Find best probe for recall prediction (recall_full)
+    
+    For each, output best accuracy, precision, recall, and F1.
+    """
+    print("\n" + "="*80)
+    print("BEST PROBES SUMMARY")
+    print("="*80)
+    
+    context_types = ["planning", "subanswer", "final"]
+    answer_tasks = ["correct", "correct_given_recall1"]
+    recall_task = "recall_full"
+    
+    for context_type in context_types:
+        print(f"\n{context_type.upper()}")
+        print("-" * 80)
+        
+        # Filter results for this context type
+        context_results = [r for r in all_results if r["context_type"] == context_type]
+        
+        # Answer prediction: compare correct and correct_given_recall1
+        answer_results = [r for r in context_results if r["task"] in answer_tasks]
+        
+        if answer_results:
+            print("\n  Answer Prediction (best across 'correct' and 'correct_given_recall1'):")
+            
+            # Filter out NaN values
+            valid_results = [r for r in answer_results if not np.isnan(r.get("test_acc", np.nan))]
+            
+            if valid_results:
+                # Best accuracy
+                best_acc = max(valid_results, key=lambda x: x.get("test_acc", float("-inf")))
+                print(f"    Best Accuracy: {best_acc['test_acc']:.4f}")
+                print(f"      Probe: {best_acc['probe_type']}, Task: {best_acc['task']}, "
+                      f"Layer: {best_acc['layer']}")
+                print(f"      Precision: {best_acc['test_precision']:.4f}, "
+                      f"Recall: {best_acc['test_recall']:.4f}, F1: {best_acc['test_f1']:.4f}")
+                
+                # Best precision
+                valid_prec = [r for r in valid_results if not np.isnan(r.get("test_precision", np.nan))]
+                if valid_prec:
+                    best_prec = max(valid_prec, key=lambda x: x.get("test_precision", float("-inf")))
+                    print(f"    Best Precision: {best_prec['test_precision']:.4f}")
+                    print(f"      Probe: {best_prec['probe_type']}, Task: {best_prec['task']}, "
+                          f"Layer: {best_prec['layer']}")
+                    print(f"      Accuracy: {best_prec['test_acc']:.4f}, "
+                          f"Recall: {best_prec['test_recall']:.4f}, F1: {best_prec['test_f1']:.4f}")
+                
+                # Best recall
+                valid_rec = [r for r in valid_results if not np.isnan(r.get("test_recall", np.nan))]
+                if valid_rec:
+                    best_rec = max(valid_rec, key=lambda x: x.get("test_recall", float("-inf")))
+                    print(f"    Best Recall: {best_rec['test_recall']:.4f}")
+                    print(f"      Probe: {best_rec['probe_type']}, Task: {best_rec['task']}, "
+                          f"Layer: {best_rec['layer']}")
+                    print(f"      Accuracy: {best_rec['test_acc']:.4f}, "
+                          f"Precision: {best_rec['test_precision']:.4f}, F1: {best_rec['test_f1']:.4f}")
+                
+                # Best F1
+                valid_f1 = [r for r in valid_results if not np.isnan(r.get("test_f1", np.nan))]
+                if valid_f1:
+                    best_f1 = max(valid_f1, key=lambda x: x.get("test_f1", float("-inf")))
+                    print(f"    Best F1: {best_f1['test_f1']:.4f}")
+                    print(f"      Probe: {best_f1['probe_type']}, Task: {best_f1['task']}, "
+                          f"Layer: {best_f1['layer']}")
+                    print(f"      Accuracy: {best_f1['test_acc']:.4f}, "
+                          f"Precision: {best_f1['test_precision']:.4f}, "
+                          f"Recall: {best_f1['test_recall']:.4f}")
+        
+        # Recall prediction: recall_full
+        recall_results = [r for r in context_results if r["task"] == recall_task]
+        
+        if recall_results:
+            print("\n  Recall Prediction (recall_full):")
+            
+            # Filter out NaN values
+            valid_results = [r for r in recall_results if not np.isnan(r.get("test_acc", np.nan))]
+            
+            if valid_results:
+                # Best accuracy
+                best_acc = max(valid_results, key=lambda x: x.get("test_acc", float("-inf")))
+                print(f"    Best Accuracy: {best_acc['test_acc']:.4f}")
+                print(f"      Probe: {best_acc['probe_type']}, Task: {best_acc['task']}, "
+                      f"Layer: {best_acc['layer']}")
+                print(f"      Precision: {best_acc['test_precision']:.4f}, "
+                      f"Recall: {best_acc['test_recall']:.4f}, F1: {best_acc['test_f1']:.4f}")
+                
+                # Best precision
+                valid_prec = [r for r in valid_results if not np.isnan(r.get("test_precision", np.nan))]
+                if valid_prec:
+                    best_prec = max(valid_prec, key=lambda x: x.get("test_precision", float("-inf")))
+                    print(f"    Best Precision: {best_prec['test_precision']:.4f}")
+                    print(f"      Probe: {best_prec['probe_type']}, Task: {best_prec['task']}, "
+                          f"Layer: {best_prec['layer']}")
+                    print(f"      Accuracy: {best_prec['test_acc']:.4f}, "
+                          f"Recall: {best_prec['test_recall']:.4f}, F1: {best_prec['test_f1']:.4f}")
+                
+                # Best recall
+                valid_rec = [r for r in valid_results if not np.isnan(r.get("test_recall", np.nan))]
+                if valid_rec:
+                    best_rec = max(valid_rec, key=lambda x: x.get("test_recall", float("-inf")))
+                    print(f"    Best Recall: {best_rec['test_recall']:.4f}")
+                    print(f"      Probe: {best_rec['probe_type']}, Task: {best_rec['task']}, "
+                          f"Layer: {best_rec['layer']}")
+                    print(f"      Accuracy: {best_rec['test_acc']:.4f}, "
+                          f"Precision: {best_rec['test_precision']:.4f}, F1: {best_rec['test_f1']:.4f}")
+                
+                # Best F1
+                valid_f1 = [r for r in valid_results if not np.isnan(r.get("test_f1", np.nan))]
+                if valid_f1:
+                    best_f1 = max(valid_f1, key=lambda x: x.get("test_f1", float("-inf")))
+                    print(f"    Best F1: {best_f1['test_f1']:.4f}")
+                    print(f"      Probe: {best_f1['probe_type']}, Task: {best_f1['task']}, "
+                          f"Layer: {best_f1['layer']}")
+                    print(f"      Accuracy: {best_f1['test_acc']:.4f}, "
+                          f"Precision: {best_f1['test_precision']:.4f}, "
+                          f"Recall: {best_f1['test_recall']:.4f}")
+    
+    print("\n" + "="*80)
+
+
+def main(
+    mode: str,
+    balance: bool = False,
+) -> None:
     full_run = mode != "test"
     print(
-        f"Running in mode: {mode!r} (full_run={full_run}, balance={balance}, "
-        f"include_retrieval={include_retrieval})"
+        f"Running in mode: {mode!r} (full_run={full_run}, balance={balance})"
     )
 
     # Reproducibility
@@ -710,10 +780,10 @@ def main(mode: str, balance: bool = False, include_retrieval: bool = False) -> N
         torch.cuda.manual_seed_all(42)
 
     # Load dataset
-    contexts, y_correct, y_recall_full = load_hotpot_decomp_dataset(
-        JSON_DATASET_PATH, include_retrieval=include_retrieval
+    contexts_dict, y_correct, y_recall_full = load_hotpot_decomp_dataset(
+        JSON_DATASET_PATH
     )
-    n_total = len(contexts)
+    n_total = len(contexts_dict["planning"])
     print(f"Loaded {n_total} examples from dataset.")
 
     # Subsample for full vs test run
@@ -726,10 +796,14 @@ def main(mode: str, balance: bool = False, include_retrieval: bool = False) -> N
     rng.shuffle(indices)
     indices = indices[:max_examples]
 
-    contexts = [contexts[i] for i in indices]
+    # Subsample all context types
+    contexts_dict = {
+        key: [contexts_list[i] for i in indices]
+        for key, contexts_list in contexts_dict.items()
+    }
     y_correct = y_correct[indices]
     y_recall_full = y_recall_full[indices]
-    n = len(contexts)
+    n = len(contexts_dict["planning"])
     print(f"Using {n} examples after subsampling (max_examples={max_examples}).")
 
     # Create splits
@@ -741,9 +815,9 @@ def main(mode: str, balance: bool = False, include_retrieval: bool = False) -> N
 
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Loading model 'meta-llama/Llama-3.1-8B' on device={device}...")
+    print(f"Loading model 'meta-llama/Llama-3.1-8B-Instruct' on device={device}...")
     model = HookedTransformer.from_pretrained(
-        "meta-llama/Llama-3.1-8B",
+        "meta-llama/Llama-3.1-8B-Instruct",
         device=str(device),
         dtype=torch.float16,
     )
@@ -762,68 +836,42 @@ def main(mode: str, balance: bool = False, include_retrieval: bool = False) -> N
 
     print(f"Layers to probe: {layers_to_probe}")
 
-    # Filter out examples longer than 2000 tokens (only if include_retrieval is enabled)
-    if include_retrieval:
-        print("Filtering examples longer than 2000 tokens...")
-        max_tokens = 2000
-        valid_indices = []
-        for i, text in enumerate(contexts):
-            toks = model.to_tokens(text, prepend_bos=True)  # (1, T)
-            token_length = toks.shape[1]
-            if token_length <= max_tokens:
-                valid_indices.append(i)
-
-        n_before = len(contexts)
-        if len(valid_indices) > 0:
-            valid_indices = np.array(valid_indices)
-            contexts = [contexts[i] for i in valid_indices]
-            y_correct = y_correct[valid_indices]
-            y_recall_full = y_recall_full[valid_indices]
-        else:
-            contexts = []
-            y_correct = np.array([], dtype=np.float32)
-            y_recall_full = np.array([], dtype=np.float32)
-        n_after = len(contexts)
-        print(
-            f"Filtered {n_before - n_after} examples longer than {max_tokens} tokens. "
-            f"Remaining: {n_after} examples."
+    # Compute activations for each context type
+    hidden_per_layer_dict = {}
+    for context_type, contexts in contexts_dict.items():
+        print(f"\nComputing activations for {context_type}...")
+        hidden_per_layer_dict[context_type] = compute_activations(
+            model, contexts, layers_to_probe, full_run=full_run
         )
-
-        if n_after == 0:
-            raise ValueError("No examples remaining after filtering by token length.")
-
-        # Recreate splits with the filtered data
-        n = n_after
-        train_idx, val_idx, test_idx = make_splits(n, rng)
-        print(
-            f"Split sizes after filtering: train={len(train_idx)}, val={len(val_idx)}, "
-            f"test={len(test_idx)}"
-        )
-
-    # Compute activations + uncertainty features
-    hidden_per_layer, uncertainty_feats = compute_activations_and_uncertainty(
-        model, contexts, layers_to_probe, full_run=full_run
-    )
 
     # Free model; we only need stored features now.
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # Train all probes
-    train_all_probes(
-        hidden_per_layer,
-        uncertainty_feats,
-        y_correct,
-        y_recall_full,
-        train_idx,
-        val_idx,
-        test_idx,
-        layers_to_probe,
-        full_run=full_run,
-        balance=balance,
-        rng=rng,
-    )
+    # Train all probes for each context type
+    all_results = []
+    for context_type in ["planning", "subanswer", "final"]:
+        print(f"\n{'='*60}")
+        print(f"Training probes for context type: {context_type}")
+        print(f"{'='*60}")
+        results = train_all_probes(
+            hidden_per_layer_dict[context_type],
+            y_correct,
+            y_recall_full,
+            train_idx,
+            val_idx,
+            test_idx,
+            layers_to_probe,
+            full_run=full_run,
+            balance=balance,
+            rng=rng,
+            context_type=context_type,
+        )
+        all_results.extend(results)
+    
+    # Print summary of best probes
+    print_best_probes(all_results)
 
 
 if __name__ == "__main__":
@@ -848,20 +896,13 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help=(
-            "Balance training dataset by downsampling. "
-            "For 'correct' tasks, balances answer distribution (correct vs incorrect). "
-            "For 'recall_full' task, balances recall distribution (recall=1.0 vs recall<1.0)."
-        ),
-    )
-    parser.add_argument(
-        "--include-retrieval",
-        action="store_true",
-        default=False,
-        help=(
-            "Include retrieved context sentences after each subquery in the input context. "
-            "Format: 'Question + Subquery 1 + Retrieved context 1 + ... + Subquery i + "
-            "Retrieved context i + Answer'. Default is to exclude retrieval contexts."
+            "Deprecated: class balancing is now always applied to the training set. "
+            "This flag is kept for backwards compatibility but has no effect."
         ),
     )
     args = parser.parse_args()
-    main(args.mode, balance=args.balance, include_retrieval=args.include_retrieval)
+    main(
+        args.mode,
+        balance=args.balance,
+    )
+

@@ -1,6 +1,6 @@
 import re
 import torch
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Union
 from mateo.decomposition.prompts import build_planning_prompt, build_subanswer_prompt, build_final_answer_prompt
 from mateo.decomposition.retrieve import retrieve_top_paragraphs, paragraphs_to_sentences
 
@@ -103,7 +103,7 @@ def fill_placeholders(subquery: str, answers: List[str]) -> str:
     return filled
 
 
-def generate_text(model, prompt: str, max_new_tokens: int = 512, temperature: float = 0.0) -> str:
+def generate_text(model, prompt: str, max_new_tokens: int = 512, temperature: float = 0.0, return_full: bool = False) -> Union[str, Tuple[str, str]]:
     """
     Generate text from HookedTransformer model.
     
@@ -112,9 +112,11 @@ def generate_text(model, prompt: str, max_new_tokens: int = 512, temperature: fl
         prompt: Input prompt string
         max_new_tokens: Maximum number of tokens to generate
         temperature: Sampling temperature (0.0 for deterministic)
+        return_full: If True, return (full_text, response_text) tuple. If False, return only generated text.
         
     Returns:
-        Generated text string
+        If return_full=True: tuple of (full prompt+response, just response)
+        If return_full=False: just the generated response text
     """
     tokenizer = model.tokenizer
     
@@ -152,14 +154,29 @@ def generate_text(model, prompt: str, max_new_tokens: int = 512, temperature: fl
     generated_text = tokenizer.decode(
         outputs[0][inputs.input_ids.shape[1]:],
         skip_special_tokens=True
-    )
+    ).strip()
     
-    # Clean up
-    del inputs, outputs
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    return generated_text.strip()
+    if return_full:
+        # Use the formatted_prompt string directly (before tokenization) to avoid duplication
+        # This is the exact string that was tokenized and fed to the model
+        # Decode the generated tokens with special tokens to match the format
+        generated_text_full = tokenizer.decode(
+            outputs[0][inputs.input_ids.shape[1]:],
+            skip_special_tokens=False  # Keep special tokens for consistency
+        )
+        # Concatenate the original formatted prompt + generated output
+        full_text = formatted_prompt + generated_text_full
+        # Clean up
+        del inputs, outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return (full_text, generated_text)
+    else:
+        # Clean up
+        del inputs, outputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return generated_text
 
 
 def run_decomposition(
@@ -178,11 +195,12 @@ def run_decomposition(
         context: List of (title, sentences) tuples from dataset
         
     Returns:
-        Dictionary with all pipeline outputs
+        Dictionary with all pipeline outputs including full prompts+responses
     """
     # Stage 1: Planning - generate subqueries
     planning_prompt = build_planning_prompt(question)
-    planning_response = generate_text(model, planning_prompt, max_new_tokens=512, temperature=0.0)
+    # Get full prompt+response and just response in one call
+    planning_full, planning_response = generate_text(model, planning_prompt, max_new_tokens=512, temperature=0.0, return_full=True)
     planning_response = clean_text(planning_response)
     
     # Parse subqueries from response
@@ -216,6 +234,7 @@ def run_decomposition(
     answers_so_far = []
     all_retrieved_paragraphs = []
     subquery_index_to_sentences = {}  # Track retrieved sentences by index
+    subanswer_full_list = []  # Store full prompt+response for each subanswer
     
     for i, subquery_template in enumerate(subqueries):
         # Fill placeholders with previous answers
@@ -239,8 +258,9 @@ def run_decomposition(
         # Build subanswer prompt
         subanswer_prompt = build_subanswer_prompt(filled_subquery, retrieved_sentences)
         
-        # Generate answer
-        subanswer_response = generate_text(model, subanswer_prompt, max_new_tokens=256, temperature=0.0)
+        # Get full prompt+response and just response in one call
+        subanswer_full, subanswer_response = generate_text(model, subanswer_prompt, max_new_tokens=256, temperature=0.0, return_full=True)
+        subanswer_full_list.append(subanswer_full)
         subanswer = clean_text(subanswer_response)
         
         # Extract just the answer (remove "Answer:" prefix if present)
@@ -262,23 +282,17 @@ def run_decomposition(
     ]
     
     final_prompt = build_final_answer_prompt(question, sub_qa_history)
-    final_response = generate_text(model, final_prompt, max_new_tokens=256, temperature=0.0)
+    # Get full prompt+response and just response in one call
+    final_full, final_response = generate_text(model, final_prompt, max_new_tokens=256, temperature=0.0, return_full=True)
     final_answer = clean_text(final_response)
     
     # Extract just the answer (remove "Answer:" prefix if present)
     if final_answer.lower().startswith("answer:"):
         final_answer = final_answer[7:].strip()
     
-    # Re-fill all subqueries with all final answers to ensure all placeholders are filled
-    subquery_to_sentences = {}
-    for i, subquery_template in enumerate(subqueries):
-        # Fill with all final answers (answers_so_far now contains all answers)
-        fully_filled_subquery = fill_placeholders(subquery_template, answers_so_far)
-        # Store the fully filled subquery (with all [ANSWER_X] replaced) as the key
-        subquery_to_sentences[fully_filled_subquery] = subquery_index_to_sentences[i]
-    
     return {
-        "question": clean_text(question),
-        "answer": final_answer,
-        "subqueries": subquery_to_sentences,  # Dictionary mapping subqueries (with all fillers filled) to their retrieved sentences
+        "planning": planning_full,
+        "subanswer": subanswer_full_list,
+        "final": final_full,
+        "answer": final_answer,  # Keep for backwards compatibility if needed
     }

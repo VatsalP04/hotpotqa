@@ -42,9 +42,9 @@ RETRIEVER = sentence_transformers.SentenceTransformer("all-MiniLM-L6-v2")
 TRAIN_DATASET = load_dataset("hotpot_qa", "distractor", split="train")
 
 #%%
-TRAIN_SAMPLE_SIZE = 28000
-DEV_SAMPLE_SIZE = 7000
-TEST_SAMPLE_SIZE = 7000
+TRAIN_SAMPLE_SIZE = 3000
+# DEV_SAMPLE_SIZE = 7000
+# TEST_SAMPLE_SIZE = 7000
 SAVE_FREQUENCY = 10
 METHOD = "decomposition"
 PREDICTIONS_PATH = f"{METHOD}_predictions.json"
@@ -181,31 +181,50 @@ for i in range(TRAIN_SAMPLE_SIZE):
         
         # Extract results
         answer = full_output["answer"]
-        subqueries = full_output["subqueries"]  # Dictionary mapping subquery -> retrieved sentences
+        planning_full = full_output["planning"]
+        subanswer_full_list = full_output["subanswer"]  # List of full prompt+response strings
+        final_full = full_output["final"]
+        
+        # Extract retrieved sentences from subanswer prompts for recall calculation
+        # Format: "Context:\n[1] sentence1\n[2] sentence2\n..."
+        all_retrieved_sentences = []
+        for subanswer_text in subanswer_full_list:
+            # Find the Context section
+            if "Context:" in subanswer_text:
+                context_start = subanswer_text.find("Context:") + len("Context:")
+                # Find where context ends (either "Question:" or "Answer:")
+                question_start = subanswer_text.find("Question:", context_start)
+                if question_start == -1:
+                    question_start = subanswer_text.find("Answer:", context_start)
+                if question_start != -1:
+                    context_section = subanswer_text[context_start:question_start].strip()
+                    # Extract sentences (format: "[1] sentence text")
+                    for line in context_section.split('\n'):
+                        line = line.strip()
+                        if line.startswith('[') and ']' in line:
+                            # Extract text after "[N] "
+                            sentence = line.split(']', 1)[1].strip()
+                            if sentence:
+                                all_retrieved_sentences.append(sentence)
+        
+        # Deduplicate
+        all_retrieved_sentences = list(dict.fromkeys(all_retrieved_sentences))  # Preserves order while removing duplicates
         
         # Extract gold sentences
         gold_sentences = extract_gold_sentences(example)
         
-        # Calculate metrics - get all retrieved sentences from subqueries for recall calculation
-        all_retrieved_sentences = []
-        for retrieved_sents in subqueries.values():
-            all_retrieved_sentences.extend(retrieved_sents)
-        # Deduplicate
-        all_retrieved_sentences = list(dict.fromkeys(all_retrieved_sentences))  # Preserves order while removing duplicates
-        
+        # Calculate metrics
         f1 = f1_score(answer, gold_answer)
         correct = 1 if f1 > 0.5 else 0
         recall = calculate_recall(all_retrieved_sentences, gold_sentences)
         
-        # Build result dict in specified order
+        # Build result dict in new format: correct, recall, planning, subanswer, final
         result = {
-            "question": question,
-            "answer": answer,
-            "gold_answer": gold_answer,
             "correct": correct,
             "recall": recall,
-            "subqueries": subqueries,  # Dictionary: subquery -> list of retrieved sentences
-            "gold_sentences": gold_sentences,
+            "planning": planning_full,
+            "subanswer": subanswer_full_list,
+            "final": final_full,
         }
         
         # Add to predictions dict with _id as key
