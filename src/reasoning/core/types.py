@@ -265,6 +265,11 @@ class SubQA:
     retrieved_titles: List[str] = field(default_factory=list)
     retrieved_paragraphs: List[str] = field(default_factory=list)
     search_queries: List[str] = field(default_factory=list)
+    # Re-attempt tracking
+    initial_answer: Optional[str] = None  # First answer (may be NOT_FOUND)
+    reattempt_query: Optional[str] = None  # Rewritten query for re-attempt
+    reattempt_answer: Optional[str] = None  # Answer from re-attempt
+    reattempt_retrieved_titles: List[str] = field(default_factory=list)  # Titles from re-attempt
 
 
 @dataclass

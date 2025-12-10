@@ -471,13 +471,41 @@ class ExperimentRunner:
                     lines.extend([
                         f"#### Sub-Q {j}",
                         f"- **Question**: {sub_qa['question']}",
-                        f"- **Answer**: {sub_qa['answer']}",
-                        f"- **Retrieved Titles**: {', '.join(sub_qa.get('retrieved_titles', []))}",
                     ])
-                    if sub_qa.get("search_queries"):
-                        lines.append(f"- **Search Queries**: {', '.join(sub_qa['search_queries'])}")
-                    if sub_qa.get("is_not_found"):
-                        lines.append("- **⚠️ NOT_FOUND**: Yes")
+                    
+                    # Show initial attempt
+                    if sub_qa.get("initial_answer"):
+                        lines.extend([
+                            "",
+                            "**Initial Attempt:**",
+                            f"- **Query**: {sub_qa['search_queries'][0] if sub_qa.get('search_queries') else 'N/A'}",
+                            f"- **Retrieved**: {', '.join(sub_qa.get('retrieved_titles', [])[:5])}",
+                            f"- **Answer**: {sub_qa['initial_answer']}",
+                            f"- **Status**: ⚠️ NOT_FOUND",
+                        ])
+                        
+                        # Show re-attempt if it happened
+                        if sub_qa.get("reattempt_query"):
+                            lines.extend([
+                                "",
+                                "**Re-Attempt (Fallback):**",
+                                f"- **Rewritten Query**: {sub_qa['reattempt_query']}",
+                                f"- **Retrieved**: {', '.join(sub_qa.get('reattempt_retrieved_titles', [])[:5])}",
+                                f"- **Re-Attempt Answer**: {sub_qa.get('reattempt_answer', 'N/A')}",
+                            ])
+                            if sub_qa.get('reattempt_answer') and sub_qa['reattempt_answer'].strip().upper() != "NOT_FOUND":
+                                lines.append(f"- **Status**: ✅ Success (used as final answer)")
+                            else:
+                                lines.append(f"- **Status**: ❌ Still NOT_FOUND")
+                    else:
+                        # No re-attempt needed
+                        lines.extend([
+                            f"- **Answer**: {sub_qa['answer']}",
+                            f"- **Retrieved Titles**: {', '.join(sub_qa.get('retrieved_titles', []))}",
+                        ])
+                        if sub_qa.get("search_queries"):
+                            lines.append(f"- **Search Query**: {sub_qa['search_queries'][0]}")
+                    
                     lines.append("")
             
             lines.extend([

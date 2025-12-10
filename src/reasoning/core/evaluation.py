@@ -51,9 +51,28 @@ def exact_match(prediction: str, gold: str) -> float:
 
 
 def precision_recall_f1(prediction: str, gold: str) -> Dict[str, float]:
-    """Calculate token-level precision, recall, and F1 score."""
-    pred_tokens = normalize_answer(prediction).split()
-    gold_tokens = normalize_answer(gold).split()
+    """
+    Calculate token-level precision, recall, and F1 score.
+    
+    Matches official HotpotQA evaluation script:
+    - Special handling for "yes", "no", "noanswer" (exact match only)
+    - Token-level F1 for other answers
+    """
+    normalized_pred = normalize_answer(prediction)
+    normalized_gold = normalize_answer(gold)
+    
+    # Special handling for yes/no/noanswer (exact match only)
+    # If prediction is yes/no/noanswer and doesn't match gold, return 0
+    if normalized_pred in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    
+    # If gold is yes/no/noanswer and doesn't match prediction, return 0
+    if normalized_gold in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    
+    # Token-level F1 for other answers
+    pred_tokens = normalized_pred.split()
+    gold_tokens = normalized_gold.split()
     
     if not pred_tokens or not gold_tokens:
         match = float(pred_tokens == gold_tokens)

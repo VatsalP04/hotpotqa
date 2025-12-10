@@ -21,10 +21,12 @@ logger = logging.getLogger(__name__)
 # LangSmith integration (optional)
 try:
     from langsmith import traceable
+    from langsmith.run_helpers import tracing_context
     LANGSMITH_AVAILABLE = True
 except ImportError:
     LANGSMITH_AVAILABLE = False
     traceable = lambda **kwargs: lambda f: f  # No-op decorator
+    tracing_context = lambda: None  # No-op context manager
 
 
 # =============================================================================
@@ -148,6 +150,7 @@ class MistralLLMClient(LLMClient):
             LANGSMITH_AVAILABLE and 
             os.environ.get("LANGSMITH_TRACING", "false").lower() == "true"
         )
+        self._langsmith_project = os.environ.get("LANGSMITH_PROJECT", "query-decomposition")
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -171,28 +174,14 @@ class MistralLLMClient(LLMClient):
         """Get the usage tracker."""
         return self._usage_tracker
     
-    @traceable(name="mistral_generate", run_type="llm")
-    def generate(
+    def _do_generate(
         self,
-        prompt: str,
+        messages: List[Dict[str, str]],
+        temperature: float,
         max_new_tokens: int,
-        temperature: float = 0.0,
         stop: Optional[Sequence[str]] = None,
     ) -> str:
-        """Generate text using Mistral API."""
-        messages = []
-        
-        if self._system_instruction:
-            messages.append({
-                "role": "system",
-                "content": self._system_instruction
-            })
-        
-        messages.append({
-            "role": "user",
-            "content": prompt
-        })
-        
+        """Internal method to perform the actual API call."""
         try:
             response = self.client.chat.complete(
                 model=self._model,
@@ -237,6 +226,87 @@ class MistralLLMClient(LLMClient):
         except Exception as e:
             logger.error(f"Error generating text: {e}")
             raise
+    
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int,
+        temperature: float = 0.0,
+        stop: Optional[Sequence[str]] = None,
+        run_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        tags: Optional[List[str]] = None,
+        **kwargs
+    ) -> str:
+        """Generate text using Mistral API with optional LangSmith tracing."""
+        messages = []
+        
+        if self._system_instruction:
+            messages.append({
+                "role": "system",
+                "content": self._system_instruction
+            })
+        
+        messages.append({
+            "role": "user",
+            "content": prompt
+        })
+        
+        # Prepare LangSmith metadata and tags
+        langsmith_metadata = {
+            "model": self._model,
+            "temperature": temperature,
+            "max_tokens": max_new_tokens,
+        }
+        if metadata:
+            langsmith_metadata.update(metadata)
+        
+        langsmith_tags = tags or ["mistral", "generation"]
+        
+        # Use LangSmith tracing if enabled
+        if self._langsmith_enabled:
+            # Prepare inputs for LangSmith - these will be visible in the trace
+            # Include full prompt and messages (not truncated) so you can see everything
+            langsmith_inputs = {
+                "prompt": prompt,  # Full prompt
+                "system_instruction": self._system_instruction or "",
+                "messages": messages,  # Full messages array
+                "temperature": temperature,
+                "max_new_tokens": max_new_tokens,
+                "stop": list(stop) if stop else None,
+                "model": self._model,
+            }
+            
+            # Use traceable with inputs as function parameter so LangSmith captures them
+            @traceable(
+                name=run_name or "mistral_generate",
+                run_type="llm",
+                project_name=self._langsmith_project,
+                metadata=langsmith_metadata,
+                tags=langsmith_tags,
+            )
+            def _generate_with_trace(inputs: dict):
+                """Generate with explicit inputs for LangSmith tracing.
+                
+                The inputs dict is passed as a parameter so LangSmith can capture
+                the full prompt and messages in the trace.
+                """
+                # Call the actual generation (use original variables, not inputs dict)
+                result = self._do_generate(
+                    messages,
+                    temperature,
+                    max_new_tokens,
+                    stop
+                )
+                return result
+            
+            # Call with inputs so LangSmith captures them in the trace
+            result = _generate_with_trace(langsmith_inputs)
+        else:
+            # No tracing, just call directly
+            result = self._do_generate(messages, temperature, max_new_tokens, stop)
+        
+        return result
     
     def get_usage_stats(self) -> Dict[str, int]:
         """Get cumulative token usage statistics."""

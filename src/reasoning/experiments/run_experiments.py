@@ -172,18 +172,25 @@ def run_comparison(args):
     
     # Create adapters (all use BM25 by default unless --use_dense is set)
     adapters = {}
+    retrieval_type = "DENSE (embeddings)" if args.use_dense else "BM25 (lexical)"
+    logger.info(f"📌 All methods will use: {retrieval_type} retrieval")
+    logger.info("")
+    
     for method in args.methods:
         method_lower = method.lower()
         if method_lower == "ircot":
             adapters["IRCoT"] = IRCoTAdapter(use_dense=args.use_dense)
+            logger.info(f"✓ IRCoT adapter created (retrieval: {retrieval_type})")
         elif method_lower in ("decomposition", "querydecomposition"):
             # Ensure self-consistency is disabled
             from src.reasoning.methods.decomposition import DecompositionConfig
             config = DecompositionConfig()
             config.self_consistency_enabled = False
             adapters["Decomposition"] = DecompositionAdapter(config=config, use_dense=args.use_dense)
+            logger.info(f"✓ Decomposition adapter created (retrieval: {retrieval_type})")
         elif method_lower in ("simplecot", "simple_cot", "basiccot", "basic_cot"):
             adapters["SimpleCoT"] = SimpleCoTAdapter(use_dense=args.use_dense)
+            logger.info(f"✓ SimpleCoT adapter created (retrieval: {retrieval_type})")
         else:
             logger.warning(f"Unknown method: {method}, skipping")
     
@@ -214,14 +221,14 @@ def run_single(args):
     adapter = create_adapter(args.method, use_dense=args.use_dense)
     method_lower = args.method.lower()
     if method_lower == "ircot":
-            method_name = "IRCoT"
+        method_name = "IRCoT"
     elif method_lower in ("decomposition", "querydecomposition"):
         method_name = "Decomposition"
     else:
         method_name = "SimpleCoT"
-        
+    
     # Run
-        results = runner.run_method(adapter, method_name)
+    results = runner.run_method(adapter, method_name)
     
     from src.reasoning.core.metrics import MetricsCalculator
     aggregate = MetricsCalculator.aggregate_metrics(results, method_name)

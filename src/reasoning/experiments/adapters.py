@@ -2,7 +2,7 @@
 Adapters for reasoning methods.
 
 Provides a unified interface for different reasoning methods.
-Uses BM25 retrieval by default (no embedding API calls required).
+Uses BM25 retrieval by default 
 """
 
 from __future__ import annotations
@@ -23,9 +23,7 @@ from .runner import MethodResult
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
 # IRCoT Adapter (BM25 by default)
-# =============================================================================
 
 class IRCoTAdapter:
     """
@@ -55,11 +53,13 @@ class IRCoTAdapter:
         # Create retriever based on preference
         if self.use_dense:
             # Dense retrieval requires embeddings (API calls)
+            logger.info("🔷 Using DENSE retrieval (embeddings) - will make API calls")
             from src.reasoning.core.embeddings import MistralEmbeddings, CachedEmbeddings
             embeddings = CachedEmbeddings(MistralEmbeddings(api_key=self.config.mistral_api_key))
             base_retriever = DenseRetriever(embeddings)
         else:
             # BM25 - no API calls, faster
+            logger.info("🔵 Using BM25 retrieval (lexical) - no API calls")
             base_retriever = BM25Retriever()
         
         # Wrap in IRCoTRetriever for state tracking
@@ -107,10 +107,7 @@ class IRCoTAdapter:
         )
 
 
-# =============================================================================
 # Decomposition Adapter (BM25 by default)
-# =============================================================================
-
 class DecompositionAdapter:
     """
     Adapter for Query Decomposition method.
@@ -136,11 +133,13 @@ class DecompositionAdapter:
     def _create_retriever(self, context: Context):
         """Create and index a retriever for the given context."""
         if self.use_dense:
+            logger.info("🔷 [Decomposition] Using DENSE retrieval (embeddings) - will make API calls")
             from src.reasoning.core.embeddings import MistralEmbeddings, CachedEmbeddings
             if self._embeddings is None:
                 self._embeddings = CachedEmbeddings(MistralEmbeddings())
             retriever = DenseRetriever(self._embeddings)
         else:
+            logger.info("🔵 [Decomposition] Using BM25 retrieval (lexical) - no API calls")
             retriever = BM25Retriever()
         
         retriever.index(context)
@@ -222,6 +221,10 @@ class DecompositionAdapter:
                         "retrieved_titles": sqa.retrieved_titles,
                         "search_queries": sqa.search_queries,
                         "is_not_found": sqa.answer.strip().upper() == "NOT_FOUND",
+                        "initial_answer": sqa.initial_answer,
+                        "reattempt_query": sqa.reattempt_query,
+                        "reattempt_answer": sqa.reattempt_answer,
+                        "reattempt_retrieved_titles": sqa.reattempt_retrieved_titles,
                     }
                     for sqa in result.sub_qas
                 ],
@@ -231,9 +234,7 @@ class DecompositionAdapter:
         )
 
 
-# =============================================================================
-# SimpleCoT Adapter (BM25 by default)
-# =============================================================================
+# SimpleCoT Adapter 
 
 class SimpleCoTAdapter:
     """
@@ -260,11 +261,13 @@ class SimpleCoTAdapter:
     def _create_retriever(self, context: Context):
         """Create and index a retriever for the given context."""
         if self.use_dense:
+            logger.info("🔷 [SimpleCoT] Using DENSE retrieval (embeddings) - will make API calls")
             from src.reasoning.core.embeddings import MistralEmbeddings, CachedEmbeddings
             if self._embeddings is None:
                 self._embeddings = CachedEmbeddings(MistralEmbeddings())
             retriever = DenseRetriever(self._embeddings)
         else:
+            logger.info("🔵 [SimpleCoT] Using BM25 retrieval (lexical) - no API calls")
             retriever = BM25Retriever()
         
         retriever.index(context)
@@ -313,9 +316,8 @@ class SimpleCoTAdapter:
         )
 
 
-# =============================================================================
+
 # Helper Classes
-# =============================================================================
 
 class RetrievalTracker:
     """Track retrieval operations for metrics."""
@@ -335,9 +337,7 @@ class RetrievalTracker:
         self.first_retrieval = list(titles)
 
 
-# =============================================================================
 # Factory Functions
-# =============================================================================
 
 def create_adapter(
     method: str,

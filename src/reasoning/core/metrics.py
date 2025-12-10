@@ -63,9 +63,28 @@ def exact_match(prediction: str, gold: str) -> float:
 
 
 def token_precision_recall_f1(prediction: str, gold: str) -> Dict[str, float]:
-    """Calculate token-level precision, recall, and F1 score."""
-    pred_tokens = normalize_answer(prediction).split()
-    gold_tokens = normalize_answer(gold).split()
+    """
+    Calculate token-level precision, recall, and F1 score.
+    
+    Matches official HotpotQA evaluation script:
+    - Special handling for "yes", "no", "noanswer" (exact match only)
+    - Token-level F1 for other answers
+    """
+    normalized_pred = normalize_answer(prediction)
+    normalized_gold = normalize_answer(gold)
+    
+    # Special handling for yes/no/noanswer (exact match only)
+    # If prediction is yes/no/noanswer and doesn't match gold, return 0
+    if normalized_pred in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    
+    # If gold is yes/no/noanswer and doesn't match prediction, return 0
+    if normalized_gold in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+    
+    # Token-level F1 for other answers
+    pred_tokens = normalized_pred.split()
+    gold_tokens = normalized_gold.split()
     
     if not pred_tokens and not gold_tokens:
         return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
@@ -295,6 +314,14 @@ class QuestionMetrics:
     f1_per_1k_tokens: float
     em_per_1k_tokens: float
     
+    # Supporting Facts (SP) metrics (official HotpotQA)
+    sp_em: float  # Exact match: all supporting fact titles retrieved
+    sp_f1: float  # F1 of supporting fact titles (same as gold_f1)
+    
+    # Joint metrics (official HotpotQA)
+    joint_em: float  # Answer EM AND SP EM both correct
+    joint_f1: float  # Answer F1 * SP F1
+    
     # Timing
     processing_time: float
     
@@ -333,6 +360,10 @@ class QuestionMetrics:
             "total_tokens": self.total_tokens,
             "f1_per_1k_tokens": self.f1_per_1k_tokens,
             "em_per_1k_tokens": self.em_per_1k_tokens,
+            "sp_em": self.sp_em,
+            "sp_f1": self.sp_f1,
+            "joint_em": self.joint_em,
+            "joint_f1": self.joint_f1,
             "processing_time": self.processing_time,
             "reasoning_chain": self.reasoning_chain,
             "error": self.error,
@@ -379,6 +410,14 @@ class AggregateMetrics:
     avg_f1_per_1k_tokens: float
     avg_em_per_1k_tokens: float
     overall_f1_per_1k_tokens: float  # F1 / (total_tokens / 1000)
+    
+    # Supporting Facts (SP) metrics (official HotpotQA)
+    avg_sp_em: float
+    avg_sp_f1: float
+    
+    # Joint metrics (official HotpotQA)
+    avg_joint_em: float
+    avg_joint_f1: float
     
     # Timing
     total_time: float
@@ -436,6 +475,16 @@ class AggregateMetrics:
                 "overall_f1_per_1k_tokens": self.overall_f1_per_1k_tokens,
             },
             
+            "supporting_facts_metrics": {
+                "avg_sp_em": self.avg_sp_em,
+                "avg_sp_f1": self.avg_sp_f1,
+            },
+            
+            "joint_metrics": {
+                "avg_joint_em": self.avg_joint_em,
+                "avg_joint_f1": self.avg_joint_f1,
+            },
+            
             "timing": {
                 "total_time": self.total_time,
                 "avg_time_per_question": self.avg_time_per_question,
@@ -489,6 +538,18 @@ class MetricsCalculator:
         first_prf = retrieval_precision_recall_f1(first_retrieved_titles, gold_titles)
         first_hit_rate = gold_paragraph_hit_rate(first_retrieved_titles, gold_titles)
         
+        # Supporting Facts (SP) metrics (official HotpotQA)
+        # SP EM: 1.0 if all gold titles are retrieved, 0.0 otherwise
+        retrieved_set = set(retrieved_titles)
+        sp_em = 1.0 if gold_titles and gold_titles.issubset(retrieved_set) else 0.0
+        sp_f1 = retrieval_prf["f1"]  # SP F1 is same as gold_f1
+        
+        # Joint metrics (official HotpotQA)
+        # Joint EM: Answer EM AND SP EM both correct
+        joint_em = em * sp_em
+        # Joint F1: Answer F1 * SP F1
+        joint_f1 = prf["f1"] * sp_f1
+        
         # Token efficiency
         total_tokens = input_tokens + output_tokens
         efficiency = token_efficiency_metrics(prf["f1"], em, input_tokens, output_tokens)
@@ -521,6 +582,10 @@ class MetricsCalculator:
             total_tokens=total_tokens,
             f1_per_1k_tokens=efficiency["f1_per_1k_tokens"],
             em_per_1k_tokens=efficiency["em_per_1k_tokens"],
+            sp_em=sp_em,
+            sp_f1=sp_f1,
+            joint_em=joint_em,
+            joint_f1=joint_f1,
             processing_time=processing_time,
             reasoning_chain=reasoning_chain,
             error=error,
@@ -547,6 +612,8 @@ class MetricsCalculator:
                 total_input_tokens=0, total_output_tokens=0, total_tokens=0,
                 avg_tokens_per_question=0.0,
                 avg_f1_per_1k_tokens=0.0, avg_em_per_1k_tokens=0.0, overall_f1_per_1k_tokens=0.0,
+                avg_sp_em=0.0, avg_sp_f1=0.0,
+                avg_joint_em=0.0, avg_joint_f1=0.0,
                 total_time=0.0, avg_time_per_question=0.0,
             )
         
@@ -570,6 +637,14 @@ class MetricsCalculator:
         avg_first_precision = sum(r.first_retrieval_precision for r in results) / n
         avg_first_f1 = sum(r.first_retrieval_f1 for r in results) / n
         avg_first_hit_rate = sum(r.first_retrieval_hit_rate for r in results) / n
+        
+        # Supporting Facts (SP) metrics
+        avg_sp_em = sum(r.sp_em for r in results) / n
+        avg_sp_f1 = sum(r.sp_f1 for r in results) / n
+        
+        # Joint metrics
+        avg_joint_em = sum(r.joint_em for r in results) / n
+        avg_joint_f1 = sum(r.joint_f1 for r in results) / n
         
         avg_retrieval_steps = sum(r.num_retrieval_steps for r in results) / n
         avg_paragraphs = sum(r.num_paragraphs_retrieved for r in results) / n
@@ -640,6 +715,10 @@ class MetricsCalculator:
             avg_f1_per_1k_tokens=avg_f1_per_1k,
             avg_em_per_1k_tokens=avg_em_per_1k,
             overall_f1_per_1k_tokens=overall_f1_per_1k,
+            avg_sp_em=avg_sp_em,
+            avg_sp_f1=avg_sp_f1,
+            avg_joint_em=avg_joint_em,
+            avg_joint_f1=avg_joint_f1,
             total_time=total_time,
             avg_time_per_question=avg_time,
             comparison_metrics=comparison_metrics,

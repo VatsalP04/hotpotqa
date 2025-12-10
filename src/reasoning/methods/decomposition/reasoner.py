@@ -55,11 +55,18 @@ class DecompositionReasoner:
         temp = temperature if temperature is not None else self.config.temperature
         prompt = decomp_prompts.build_planning_prompt(main_question)
         
+        # LangSmith tracing
+        metadata = {"step": "planning", "main_question": main_question[:100]}
+        tags = ["decomposition", "planning"]
+        
         response = self.llm.generate(
             prompt=prompt,
             max_new_tokens=300,
             temperature=temp,
             stop=None,
+            run_name="decomposition_planning",
+            metadata=metadata,
+            tags=tags,
         )
         
         # Parse numbered questions from response
@@ -95,6 +102,7 @@ class DecompositionReasoner:
         sub_question: str,
         paragraphs: List,
         temperature: Optional[float] = None,
+        is_reattempt: bool = False,
     ) -> str:
         """Answer a sub-question using retrieved paragraphs."""
         temp = temperature if temperature is not None else self.config.temperature
@@ -104,14 +112,69 @@ class DecompositionReasoner:
         
         prompt = decomp_prompts.build_subanswer_prompt(sub_question, para_texts)
         
+        # LangSmith tracing
+        metadata = {
+            "step": "sub_answer",
+            "sub_question": sub_question[:100],
+            "num_paragraphs": len(paragraphs),
+            "is_reattempt": is_reattempt,
+        }
+        tags = ["decomposition", "sub_answer"]
+        if is_reattempt:
+            tags.append("reattempt")
+        
         response = self.llm.generate(
             prompt=prompt,
             max_new_tokens=self.config.max_tokens_suba,
             temperature=temp,
             stop=["\n"],
+            run_name="decomposition_sub_answer",
+            metadata=metadata,
+            tags=tags,
         )
         
         # Clean up
+        answer = response.strip()
+        for prefix in ["Answer:", "A:"]:
+            if answer.lower().startswith(prefix.lower()):
+                answer = answer[len(prefix):].strip()
+        
+        return answer
+    
+    def _answer_subquestion_forced(
+        self,
+        sub_question: str,
+        paragraphs: List,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """
+        Answer a sub-question but force an answer (no NOT_FOUND escape).
+        Used after a reattempt still returns NOT_FOUND.
+        """
+        temp = temperature if temperature is not None else self.config.temperature
+        para_texts = []
+        for p in paragraphs:
+            para_texts.append(f"{p.title}: {p.text}")
+        
+        prompt = decomp_prompts.build_forced_subanswer_prompt(sub_question, para_texts)
+        
+        metadata = {
+            "step": "sub_answer_forced",
+            "sub_question": sub_question[:100],
+            "num_paragraphs": len(paragraphs),
+        }
+        tags = ["decomposition", "sub_answer", "forced"]
+        
+        response = self.llm.generate(
+            prompt=prompt,
+            max_new_tokens=self.config.max_tokens_suba,
+            temperature=temp,
+            stop=["\n"],
+            run_name="decomposition_sub_answer_forced",
+            metadata=metadata,
+            tags=tags,
+        )
+        
         answer = response.strip()
         for prefix in ["Answer:", "A:"]:
             if answer.lower().startswith(prefix.lower()):
@@ -129,11 +192,22 @@ class DecompositionReasoner:
         temp = temperature if temperature is not None else self.config.temperature
         prompt = decomp_prompts.build_final_answer_prompt(main_question, sub_qa_history)
         
+        # LangSmith tracing
+        metadata = {
+            "step": "final_answer",
+            "main_question": main_question[:100],
+            "num_sub_questions": len(sub_qa_history),
+        }
+        tags = ["decomposition", "final_answer"]
+        
         response = self.llm.generate(
             prompt=prompt,
             max_new_tokens=self.config.max_tokens_final,
             temperature=temp,
             stop=["\n"],
+            run_name="decomposition_final_answer",
+            metadata=metadata,
+            tags=tags,
         )
         
         answer = response.strip()
@@ -151,11 +225,24 @@ class DecompositionReasoner:
     ) -> str:
         """Generate a search query for fallback retrieval."""
         prompt = decomp_prompts.build_query_rewrite_prompt(main_question, failed_sub_question, previous_answers)
+        
+        # LangSmith tracing
+        metadata = {
+            "step": "query_rewrite",
+            "main_question": main_question[:100],
+            "failed_sub_question": failed_sub_question[:100],
+            "num_previous_answers": len(previous_answers),
+        }
+        tags = ["decomposition", "query_rewrite", "fallback"]
+        
         response = self.llm.generate(
             prompt=prompt,
             max_new_tokens=64,
             temperature=0.3,
             stop=["\n"],
+            run_name="decomposition_query_rewrite",
+            metadata=metadata,
+            tags=tags,
         )
         return response.strip()
     
@@ -181,25 +268,50 @@ class DecompositionReasoner:
             retrieved_titles = [p.title for p in paragraphs]
             all_retrieved_titles.extend(retrieved_titles)
             
-            sub_answer = self._answer_subquestion(filled_question, paragraphs, temperature=temp)
+            sub_answer = self._answer_subquestion(filled_question, paragraphs, temperature=temp, is_reattempt=False)
+            initial_answer = sub_answer
+            initial_retrieved = retrieved_titles.copy()
             
             # Fallback if not found
+            reattempt_query = None
+            reattempt_answer = None
+            reattempt_retrieved = []
+            
             if self._is_not_found(sub_answer):
-                rewrite_query = self._generate_search_query(question, filled_question, sub_qa_history)
-                if rewrite_query:
-                    query_history.append(rewrite_query)
-                    fallback_paragraphs = self.retriever.retrieve(
-                        rewrite_query,
-                        max(cfg.k_retrieve + 1, cfg.k_retrieve)
-                    )
-                    if fallback_paragraphs:
-                        fallback_titles = [p.title for p in fallback_paragraphs]
-                        all_retrieved_titles.extend(fallback_titles)
-                        alt_answer = self._answer_subquestion(filled_question, fallback_paragraphs, temperature=temp)
-                        if not self._is_not_found(alt_answer):
-                            paragraphs = fallback_paragraphs
-                            retrieved_titles = fallback_titles
-                            sub_answer = alt_answer
+                # Fallback strategy depends on config (for ablation studies)
+                if cfg.enable_search_query_fallback:
+                    # Strategy 1: Generate new search query and reattempt
+                    rewrite_query = self._generate_search_query(question, filled_question, sub_qa_history)
+                    if rewrite_query:
+                        query_history.append(rewrite_query)
+                        reattempt_query = rewrite_query
+                        fallback_paragraphs = self.retriever.retrieve(
+                            rewrite_query,
+                            max(cfg.k_retrieve + 1, cfg.k_retrieve)
+                        )
+                        if fallback_paragraphs:
+                            fallback_titles = [p.title for p in fallback_paragraphs]
+                            all_retrieved_titles.extend(fallback_titles)
+                            reattempt_retrieved = fallback_titles.copy()
+                            alt_answer = self._answer_subquestion(filled_question, fallback_paragraphs, temperature=temp, is_reattempt=True)
+                            reattempt_answer = alt_answer
+                            if not self._is_not_found(alt_answer):
+                                paragraphs = fallback_paragraphs
+                                retrieved_titles = fallback_titles
+                                sub_answer = alt_answer
+                            elif cfg.enable_relaxed_prompt_fallback:
+                                # Still NOT_FOUND after reattempt: force an answer with relaxed prompt
+                                forced_answer = self._answer_subquestion_forced(filled_question, fallback_paragraphs, temperature=temp)
+                                reattempt_answer = forced_answer
+                                paragraphs = fallback_paragraphs
+                                retrieved_titles = fallback_titles
+                                sub_answer = forced_answer
+                elif cfg.enable_relaxed_prompt_fallback:
+                    # Strategy 2: Skip search query, directly use relaxed prompt on original paragraphs
+                    forced_answer = self._answer_subquestion_forced(filled_question, paragraphs, temperature=temp)
+                    reattempt_answer = forced_answer
+                    sub_answer = forced_answer
+                # else: Strategy 3 (no fallback) - keep NOT_FOUND as the answer
             
             answers_so_far.append(sub_answer)
             
@@ -211,6 +323,10 @@ class DecompositionReasoner:
                 retrieved_titles=retrieved_titles,
                 retrieved_paragraphs=paragraphs_texts,
                 search_queries=query_history,
+                initial_answer=initial_answer if self._is_not_found(initial_answer) else None,
+                reattempt_query=reattempt_query,
+                reattempt_answer=reattempt_answer,
+                reattempt_retrieved_titles=reattempt_retrieved,
             )
             sub_qas.append(sub_qa)
             sub_qa_history.append((filled_question, sub_answer))
@@ -226,18 +342,18 @@ class DecompositionReasoner:
         )
     
     def _run_with_self_consistency(self, question: str) -> DecompositionResult:
-        """Run with self-consistency voting."""
+        """Run with self-consistency voting.
+        
+        Runs the decomposition multiple times with different temperatures
+        and returns the most common answer (majority voting).
+        """
         cfg = self.config
-        allowed_samples = {1, 3, 5}
         num_samples = cfg.self_consistency_num_samples
-        if num_samples not in allowed_samples:
-            raise ValueError("self_consistency_num_samples must be one of {1, 3, 5}")
+        
+        if num_samples < 1:
+            raise ValueError("self_consistency_num_samples must be at least 1")
         
         temperatures = cfg.self_consistency_temperatures or [cfg.temperature]
-        allowed_temps = {0.5, 0.6, 0.7}
-        for temp in temperatures:
-            if temp not in allowed_temps:
-                raise ValueError("self_consistency_temperatures must be drawn from {0.5, 0.6, 0.7}")
         
         runs: List[Tuple[DecompositionResult, str]] = []
         for idx in range(num_samples):
@@ -245,9 +361,11 @@ class DecompositionReasoner:
             result = self._run_single(question, temperature=temp)
             runs.append((result, normalize_answer(result.final_answer)))
         
+        # Majority voting
         counts = Counter(norm for _, norm in runs)
         winning_norm, _ = counts.most_common(1)[0]
         
+        # Return the first result that matches the winning answer
         for result, norm in runs:
             if norm == winning_norm:
                 return result

@@ -85,6 +85,31 @@ def build_subanswer_prompt(
     return "\n".join(prompt_parts)
 
 
+def build_forced_subanswer_prompt(
+    sub_question: str,
+    retrieved_paragraphs: List[str],
+) -> str:
+    """Build a less-constrained prompt that forces an answer (no NOT_FOUND escape)."""
+    prompt_parts = [
+        "Answer the question using ONLY the provided context.",
+        "Give a VERY SHORT answer (a few words) using the exact wording from the context. Do not explain.",
+        "",
+        "Context:",
+    ]
+
+    for i, para in enumerate(retrieved_paragraphs, 1):
+        prompt_parts.append(f"[{i}] {para}")
+
+    prompt_parts.extend([
+        "",
+        f"Question: {sub_question}",
+        "",
+        "Answer:",
+    ])
+
+    return "\n".join(prompt_parts)
+
+
 def build_final_answer_prompt(
     main_question: str,
     sub_qa_history: List[Tuple[str, str]],
@@ -117,7 +142,7 @@ def build_query_rewrite_prompt(
 ) -> str:
     """Build prompt for rewriting a query when initial retrieval fails."""
     prompt_parts = [
-        "You are writing a search query to help answer a sub-question derived from a query decomposition prompt from a multi-hop QA problem.",
+        "You are writing a search query for BM25 to help answer a sub-question derived from a query decomposition prompt from a multi-hop QA problem.",
         "The query should be specific, include key entities, and mention any constraints (dates, nationalities, relationships).",
         "Return ONLY the query text.",
         "",

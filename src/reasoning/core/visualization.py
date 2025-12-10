@@ -404,6 +404,169 @@ def plot_efficiency_comparison(
     return output_path
 
 
+def plot_answer_metrics(
+    aggregates: Dict[str, Dict],
+    output_path: str,
+    config: Optional[PlotConfig] = None,
+) -> Optional[str]:
+    """
+    Plot comprehensive answer quality metrics (EM, F1, Precision, Recall).
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+    
+    config = config or PlotConfig()
+    setup_plot_style(config)
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    methods = list(aggregates.keys())
+    x = np.arange(len(methods))
+    width = 0.2
+    
+    em_vals = [aggregates[m].get("answer_metrics", {}).get("avg_em", 0) for m in methods]
+    f1_vals = [aggregates[m].get("answer_metrics", {}).get("avg_f1", 0) for m in methods]
+    prec_vals = [aggregates[m].get("answer_metrics", {}).get("avg_precision", 0) for m in methods]
+    recall_vals = [aggregates[m].get("answer_metrics", {}).get("avg_recall", 0) for m in methods]
+    
+    bars1 = ax.bar(x - 1.5*width, em_vals, width, label='EM', color=COLORS["primary"])
+    bars2 = ax.bar(x - 0.5*width, f1_vals, width, label='F1', color=COLORS["secondary"])
+    bars3 = ax.bar(x + 0.5*width, prec_vals, width, label='Precision', color=COLORS["tertiary"])
+    bars4 = ax.bar(x + 1.5*width, recall_vals, width, label='Recall', color=COLORS["success"])
+    
+    ax.set_ylabel("Score")
+    ax.set_title("Answer Quality Metrics (Comprehensive)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels
+    for bars in [bars1, bars2, bars3, bars4]:
+        for bar in bars:
+            height = bar.get_height()
+            if height > 0.01:  # Only label if significant
+                ax.annotate(f'{height:.2f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=config.dpi, format=config.save_format)
+    plt.close()
+    
+    logger.info(f"Saved answer metrics plot to {output_path}")
+    return output_path
+
+
+def plot_supporting_facts_metrics(
+    aggregates: Dict[str, Dict],
+    output_path: str,
+    config: Optional[PlotConfig] = None,
+) -> Optional[str]:
+    """
+    Plot Supporting Facts (SP) metrics: SP EM and SP F1.
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+    
+    config = config or PlotConfig()
+    setup_plot_style(config)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    methods = list(aggregates.keys())
+    colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods]
+    x = np.arange(len(methods))
+    width = 0.6
+    
+    # SP EM
+    sp_em_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_em", 0) for m in methods]
+    bars1 = axes[0].bar(methods, sp_em_vals, width, color=colors, alpha=0.8)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title("Supporting Facts Exact Match (SP EM)\n(All supporting fact paragraphs retrieved)")
+    axes[0].set_ylim(0, 1.05)
+    axes[0].grid(True, alpha=0.3, axis='y')
+    
+    for bar, val in zip(bars1, sp_em_vals):
+        axes[0].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+    
+    # SP F1
+    sp_f1_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_f1", 0) for m in methods]
+    bars2 = axes[1].bar(methods, sp_f1_vals, width, color=colors, alpha=0.8)
+    axes[1].set_ylabel("Score")
+    axes[1].set_title("Supporting Facts F1 (SP F1)\n(F1 of supporting fact paragraph retrieval)")
+    axes[1].set_ylim(0, 1.05)
+    axes[1].grid(True, alpha=0.3, axis='y')
+    
+    for bar, val in zip(bars2, sp_f1_vals):
+        axes[1].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=config.dpi, format=config.save_format)
+    plt.close()
+    
+    logger.info(f"Saved supporting facts metrics plot to {output_path}")
+    return output_path
+
+
+def plot_joint_metrics(
+    aggregates: Dict[str, Dict],
+    output_path: str,
+    config: Optional[PlotConfig] = None,
+) -> Optional[str]:
+    """
+    Plot Joint metrics: Joint EM and Joint F1.
+    
+    Joint EM = Answer EM × SP EM (both must be correct)
+    Joint F1 = Answer F1 × SP F1
+    """
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+    
+    config = config or PlotConfig()
+    setup_plot_style(config)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    methods = list(aggregates.keys())
+    colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods]
+    x = np.arange(len(methods))
+    width = 0.6
+    
+    # Joint EM
+    joint_em_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_em", 0) for m in methods]
+    bars1 = axes[0].bar(methods, joint_em_vals, width, color=colors, alpha=0.8)
+    axes[0].set_ylabel("Score")
+    axes[0].set_title("Joint Exact Match (Joint EM)\n(Answer EM AND SP EM both correct)")
+    axes[0].set_ylim(0, 1.05)
+    axes[0].grid(True, alpha=0.3, axis='y')
+    
+    for bar, val in zip(bars1, joint_em_vals):
+        axes[0].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+    
+    # Joint F1
+    joint_f1_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_f1", 0) for m in methods]
+    bars2 = axes[1].bar(methods, joint_f1_vals, width, color=colors, alpha=0.8)
+    axes[1].set_ylabel("Score")
+    axes[1].set_title("Joint F1 (Joint F1)\n(Answer F1 × SP F1)")
+    axes[1].set_ylim(0, 1.05)
+    axes[1].grid(True, alpha=0.3, axis='y')
+    
+    for bar, val in zip(bars2, joint_f1_vals):
+        axes[1].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
+                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=config.dpi, format=config.save_format)
+    plt.close()
+    
+    logger.info(f"Saved joint metrics plot to {output_path}")
+    return output_path
+
+
 def plot_metrics_summary(
     aggregates: Dict[str, Dict],
     output_path: str,
@@ -418,7 +581,7 @@ def plot_metrics_summary(
     config = config or PlotConfig()
     setup_plot_style(config)
     
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     
     methods = list(aggregates.keys())
     colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods]
@@ -442,8 +605,61 @@ def plot_metrics_summary(
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 2. Retrieval Quality
+    # Add value labels
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    
+    # 2. Supporting Facts (SP) Metrics
     ax = axes[0, 1]
+    
+    sp_em_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_em", 0) for m in methods]
+    sp_f1_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_f1", 0) for m in methods]
+    
+    bars1 = ax.bar(x - width/2, sp_em_vals, width, label='SP EM', color=COLORS["success"])
+    bars2 = ax.bar(x + width/2, sp_f1_vals, width, label='SP F1', color=COLORS["tertiary"])
+    
+    ax.set_ylabel("Score")
+    ax.set_title("Supporting Facts (SP) Metrics")
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    
+    # 3. Joint Metrics (Answer AND SP both correct)
+    ax = axes[0, 2]
+    
+    joint_em_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_em", 0) for m in methods]
+    joint_f1_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_f1", 0) for m in methods]
+    
+    bars1 = ax.bar(x - width/2, joint_em_vals, width, label='Joint EM', color=COLORS["quaternary"])
+    bars2 = ax.bar(x + width/2, joint_f1_vals, width, label='Joint F1', color="#8B4513")
+    
+    ax.set_ylabel("Score")
+    ax.set_title("Joint Metrics (Answer + SP)")
+    ax.set_xticks(x)
+    ax.set_xticklabels(methods)
+    ax.legend()
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3, axis='y')
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
+    
+    # 4. Retrieval Quality
+    ax = axes[1, 0]
     
     gold_recall = [aggregates[m].get("retrieval_metrics", {}).get("avg_gold_recall", 0) for m in methods]
     first_recall = [aggregates[m].get("first_retrieval_metrics", {}).get("avg_recall", 0) for m in methods]
@@ -459,8 +675,8 @@ def plot_metrics_summary(
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 3. Token Usage
-    ax = axes[1, 0]
+    # 5. Token Usage
+    ax = axes[1, 1]
     
     avg_tokens = [aggregates[m].get("token_usage", {}).get("avg_tokens_per_question", 0) for m in methods]
     
@@ -473,8 +689,8 @@ def plot_metrics_summary(
         ax.annotate(f'{val:.0f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # 4. Efficiency
-    ax = axes[1, 1]
+    # 6. Efficiency
+    ax = axes[1, 2]
     
     f1_per_1k = [aggregates[m].get("efficiency", {}).get("overall_f1_per_1k_tokens", 0) for m in methods]
     
@@ -487,7 +703,7 @@ def plot_metrics_summary(
         ax.annotate(f'{val:.4f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    plt.suptitle("Experiment Summary", fontsize=16, fontweight='bold', y=1.02)
+    plt.suptitle("Experiment Summary (Official HotpotQA Metrics)", fontsize=16, fontweight='bold', y=1.02)
     plt.tight_layout()
     plt.savefig(output_path, dpi=config.dpi, format=config.save_format, bbox_inches='tight')
     plt.close()
@@ -555,6 +771,21 @@ class VisualizationGenerator:
         path = str(self.plots_dir / "metrics_summary.png")
         if plot_metrics_summary(aggregate_results, path, self.config):
             plots["metrics_summary"] = path
+        
+        # Answer Metrics (comprehensive)
+        path = str(self.plots_dir / "answer_metrics.png")
+        if plot_answer_metrics(aggregate_results, path, self.config):
+            plots["answer_metrics"] = path
+        
+        # Supporting Facts Metrics
+        path = str(self.plots_dir / "supporting_facts_metrics.png")
+        if plot_supporting_facts_metrics(aggregate_results, path, self.config):
+            plots["supporting_facts_metrics"] = path
+        
+        # Joint Metrics
+        path = str(self.plots_dir / "joint_metrics.png")
+        if plot_joint_metrics(aggregate_results, path, self.config):
+            plots["joint_metrics"] = path
         
         logger.info(f"Generated {len(plots)} plots in {self.plots_dir}")
         return plots
