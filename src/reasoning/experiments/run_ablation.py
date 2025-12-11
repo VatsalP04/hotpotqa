@@ -48,10 +48,11 @@ logger = logging.getLogger(__name__)
 def create_ablation_configs():
     """Create configurations for each ablation variant."""
     return {
-        "Decomp_Full": DecompositionConfig.full_pipeline(),
-        "Decomp_RelaxedOnly": DecompositionConfig.relaxed_only(),
-        "Decomp_Full+SC": DecompositionConfig.full_with_self_consistency(num_samples=5, temperature=0.6),
-        "Decomp_NoFallback": DecompositionConfig.no_fallback(),
+        "Decomp_RelaxedInitial": DecompositionConfig.relaxed_initial(),
+        "Decomp_NoFallback": DecompositionConfig.notfound_no_fallback(),
+        "Decomp_DirectRelaxed": DecompositionConfig.notfound_direct_relaxed(),
+        "Decomp_SearchFallback": DecompositionConfig.notfound_with_search_fallback(),
+        "Decomp_FullPipeline": DecompositionConfig.full_pipeline(),
     }
 
 
@@ -61,13 +62,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Ablation Variants:
-  Decomp_Full       - Full pipeline: search query fallback + relaxed prompt
-  Decomp_RelaxedOnly - Skip search query, directly use relaxed prompt on NOT_FOUND
-  Decomp_Full+SC    - Full pipeline + self-consistency (5 samples @ 0.6 temp)
-  Decomp_NoFallback - No fallback, keep NOT_FOUND as answer (baseline)
+  Decomp_RelaxedInitial - Relaxed prompt (no NOT_FOUND) as initial answering
+  Decomp_NoFallback     - NOT_FOUND prompt only, no fallbacks (baseline)
+  Decomp_DirectRelaxed  - NOT_FOUND prompt -> direct relaxed fallback (no search)
+  Decomp_SearchFallback - NOT_FOUND prompt -> search query fallback only
+  Decomp_FullPipeline   - Full: NOT_FOUND -> search fallback -> relaxed fallback
+
+Flow Comparison:
+  RelaxedInitial:  SubQ -> Retrieve -> RelaxedPrompt -> Answer (always answers)
+  NoFallback:      SubQ -> Retrieve -> NOT_FOUND prompt -> Answer (may be NOT_FOUND)
+  DirectRelaxed:   SubQ -> Retrieve -> NOT_FOUND prompt -> (if NOT_FOUND) -> RelaxedPrompt
+  SearchFallback:  SubQ -> Retrieve -> NOT_FOUND prompt -> (if NOT_FOUND) -> SearchQuery -> Reattempt
+  FullPipeline:    SubQ -> Retrieve -> NOT_FOUND prompt -> (if NOT_FOUND) -> SearchQuery -> Reattempt -> (if still NOT_FOUND) -> RelaxedPrompt
 
 Examples:
-  # Run all ablation variants
+  # Run all 5 ablation variants
   uv run python src/reasoning/experiments/run_ablation.py \\
       --data_path data/hotpotqa/hotpot_dev_distractor_v1.json \\
       --num_samples 100
@@ -75,7 +84,7 @@ Examples:
   # Run specific variants
   uv run python src/reasoning/experiments/run_ablation.py \\
       --data_path data/hotpotqa/hotpot_dev_distractor_v1.json \\
-      --variants Decomp_Full Decomp_RelaxedOnly \\
+      --variants Decomp_NoFallback Decomp_DirectRelaxed \\
       --num_samples 50
         """
     )
@@ -92,10 +101,13 @@ Examples:
                        help="Specific variants to run (default: all)")
     parser.add_argument("--no_plots", action="store_true",
                        help="Skip plot generation")
+    parser.add_argument("--no_resume", action="store_true",
+                       help="Don't resume from checkpoints (start fresh)")
+    parser.add_argument("--checkpoint_interval", type=int, default=100,
+                       help="Save checkpoint every N questions (default: 100)")
     
     args = parser.parse_args()
     
-    # Check API key
     api_key = os.environ.get("MISTRAL_API_KEY", "")
     if not api_key:
         logger.error("MISTRAL_API_KEY environment variable not set")
@@ -115,13 +127,14 @@ def run_ablation(args):
     logger.info(f"Output: {args.output_dir}")
     logger.info("=" * 60)
     
-    # Create runner
+    # Create runner with checkpointing
     runner = ExperimentRunner(
         data_path=args.data_path,
         output_dir=args.output_dir,
         num_samples=args.num_samples,
         seed=args.seed,
         generate_plots=not args.no_plots,
+        checkpoint_interval=args.checkpoint_interval,
     )
     
     # Get ablation configs
@@ -144,20 +157,21 @@ def run_ablation(args):
         logger.info(f"      self_consistency: {config.self_consistency_enabled} (n={config.self_consistency_num_samples})")
     logger.info("")
     
-    # Create adapters
     adapters = {}
     for name, config in configs.items():
         adapters[name] = DecompositionAdapter(config=config, use_dense=False)
         logger.info(f"✓ Created adapter: {name}")
     
-    # Run comparison
-    runner.compare_methods(adapters)
+    resume = not args.no_resume
+    if resume:
+        logger.info("💾 Checkpointing enabled")
+    runner.compare_methods(adapters, resume=resume)
     
     logger.info("")
-    logger.info("=" * 60)
+ 
     logger.info("ABLATION STUDY COMPLETE")
     logger.info(f"Results saved to: {args.output_dir}")
-    logger.info("=" * 60)
+
 
 
 if __name__ == "__main__":

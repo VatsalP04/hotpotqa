@@ -23,8 +23,6 @@ from .runner import MethodResult
 logger = logging.getLogger(__name__)
 
 
-# IRCoT Adapter (BM25 by default)
-
 class IRCoTAdapter:
     """
     Adapter for IRCoT method.
@@ -46,26 +44,20 @@ class IRCoTAdapter:
     
     def _init_system(self, context: Context):
         """Initialize IRCoT system with retriever for this context."""
-        # Load demos once
         if self._demos is None:
             self._demos = load_default_demos(self.config.num_few_shot_examples)
         
-        # Create retriever based on preference
         if self.use_dense:
-            # Dense retrieval requires embeddings (API calls)
             logger.info("🔷 Using DENSE retrieval (embeddings) - will make API calls")
             from src.reasoning.core.embeddings import MistralEmbeddings, CachedEmbeddings
             embeddings = CachedEmbeddings(MistralEmbeddings(api_key=self.config.mistral_api_key))
             base_retriever = DenseRetriever(embeddings)
         else:
-            # BM25 - no API calls, faster
             logger.info("🔵 Using BM25 retrieval (lexical) - no API calls")
             base_retriever = BM25Retriever()
         
-        # Wrap in IRCoTRetriever for state tracking
         retriever = IRCoTRetriever(base_retriever, self.config.max_total_paragraphs)
         
-        # Create system
         self._system = IRCoTSystem(
             self.config,
             self._demos,
@@ -74,22 +66,17 @@ class IRCoTAdapter:
     
     def answer(self, question: str, context: Context) -> MethodResult:
         """Answer a question using IRCoT."""
-        # Initialize system with fresh retriever for this context
         self._init_system(context)
         
-        # Reset usage stats
         if hasattr(self._system.llm, 'reset_usage_stats'):
             self._system.llm.reset_usage_stats()
         if hasattr(self._system.qa_reader.llm, 'reset_usage_stats'):
             self._system.qa_reader.llm.reset_usage_stats()
         
-        # Run IRCoT
         result = self._system.answer(question, context, use_interleaved=True)
         
-        # Get token usage
         stats = self._system.stats
         
-        # Get retrieval info from the retriever
         retriever = self._system.retriever
         first_titles = retriever.first_retrieval_titles if hasattr(retriever, 'first_retrieval_titles') else []
         num_steps = len(retriever.history) if hasattr(retriever, 'history') else result.num_steps
@@ -107,7 +94,6 @@ class IRCoTAdapter:
         )
 
 
-# Decomposition Adapter (BM25 by default)
 class DecompositionAdapter:
     """
     Adapter for Query Decomposition method.
@@ -153,10 +139,8 @@ class DecompositionAdapter:
         if hasattr(self._llm, 'reset_usage_stats'):
             self._llm.reset_usage_stats()
         
-        # Create retriever
         base_retriever = self._create_retriever(context)
         
-        # Track retrieval info
         retrieval_tracker = RetrievalTracker()
         
         class RetrieverWrapper:
@@ -170,7 +154,6 @@ class DecompositionAdapter:
                 results = self._retriever.retrieve(query, k=top_k)
                 paragraphs = [r.paragraph for r in results]
                 
-                # Track retrieval
                 self._tracker.add_retrieval([p.title for p in paragraphs])
                 if not self._first_retrieval_done:
                     self._tracker.set_first_retrieval([p.title for p in paragraphs])
@@ -180,16 +163,13 @@ class DecompositionAdapter:
         
         retriever = RetrieverWrapper(base_retriever, retrieval_tracker)
         
-        # Create reasoner and run
         reasoner = DecompositionReasoner(retriever, self._llm, self.config)
         result = reasoner.run(question)
         
-        # Get token usage
         usage = {}
         if hasattr(self._llm, 'get_usage_stats'):
             usage = self._llm.get_usage_stats()
         
-        # Build reasoning chain from sub-QAs with search queries
         reasoning_parts = []
         all_search_queries = []
         not_found_count = 0
@@ -234,8 +214,6 @@ class DecompositionAdapter:
         )
 
 
-# SimpleCoT Adapter 
-
 class SimpleCoTAdapter:
     """
     Adapter for Simple Chain-of-Thought method.
@@ -277,14 +255,11 @@ class SimpleCoTAdapter:
         """Answer a question using SimpleCoT."""
         self._init_components()
         
-        # Reset usage stats
         if hasattr(self._llm, 'reset_usage_stats'):
             self._llm.reset_usage_stats()
         
-        # Create retriever
         base_retriever = self._create_retriever(context)
         
-        # Wrap retriever
         class RetrieverWrapper:
             def __init__(self, retriever):
                 self._retriever = retriever
@@ -295,11 +270,9 @@ class SimpleCoTAdapter:
         
         retriever = RetrieverWrapper(base_retriever)
         
-        # Create reasoner and run
         reasoner = SimpleCoTReasoner(retriever, self._llm, self.config)
         result = reasoner.run(question)
         
-        # Get token usage
         usage = {}
         if hasattr(self._llm, 'get_usage_stats'):
             usage = self._llm.get_usage_stats()
@@ -308,16 +281,13 @@ class SimpleCoTAdapter:
             answer=result.answer,
             reasoning_chain=result.reasoning_chain,
             retrieved_titles=result.retrieved_titles,
-            first_retrieved_titles=result.retrieved_titles,  # SimpleCoT only has one retrieval
+            first_retrieved_titles=result.retrieved_titles,
             num_retrieval_steps=1,
             input_tokens=usage.get('input_tokens', 0),
             output_tokens=usage.get('output_tokens', 0),
             embedding_tokens=usage.get('embedding_tokens', 0),
         )
 
-
-
-# Helper Classes
 
 class RetrievalTracker:
     """Track retrieval operations for metrics."""
@@ -336,8 +306,6 @@ class RetrievalTracker:
         """Set the first retrieval titles."""
         self.first_retrieval = list(titles)
 
-
-# Factory Functions
 
 def create_adapter(
     method: str,
@@ -363,7 +331,6 @@ def create_adapter(
     
     elif method in ("decomposition", "querydecomposition"):
         config = DecompositionConfig(**{k: v for k, v in kwargs.items() if hasattr(DecompositionConfig, k)})
-        # Ensure self-consistency is disabled
         config.self_consistency_enabled = False
         return DecompositionAdapter(config=config, use_dense=use_dense)
     

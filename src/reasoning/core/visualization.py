@@ -21,7 +21,6 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Try to import matplotlib, but allow running without it
 try:
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
@@ -31,11 +30,6 @@ except ImportError:
     logger.warning("matplotlib not available. Plotting disabled.")
 
 
-# =============================================================================
-# Color Schemes
-# =============================================================================
-
-# Professional color palette
 COLORS = {
     "primary": "#2E86AB",      # Blue
     "secondary": "#A23B72",    # Magenta
@@ -58,10 +52,6 @@ QUESTION_TYPE_COLORS = {
     "bridge": "#A23B72",
 }
 
-
-# =============================================================================
-# Plot Configuration
-# =============================================================================
 
 @dataclass
 class PlotConfig:
@@ -94,10 +84,6 @@ def setup_plot_style(config: PlotConfig):
         'figure.dpi': config.dpi,
     })
 
-
-# =============================================================================
-# Individual Plot Functions
-# =============================================================================
 
 def plot_f1_vs_tokens(
     results: Dict[str, List[Dict]],
@@ -134,7 +120,6 @@ def plot_f1_vs_tokens(
         
         ax.scatter(tokens, f1_scores, label=method_name, color=color, alpha=0.6, s=50)
         
-        # Add trend line
         if len(tokens) > 1:
             z = np.polyfit(tokens, f1_scores, 1)
             p = np.poly1d(z)
@@ -146,8 +131,6 @@ def plot_f1_vs_tokens(
     ax.set_title("F1 Score vs Token Usage")
     ax.legend()
     ax.grid(True, alpha=0.3)
-    
-    # Set y-axis limits
     ax.set_ylim(0, 1.05)
     
     plt.tight_layout()
@@ -178,7 +161,6 @@ def plot_retrieval_quality(
     metrics = ["gold_recall", "gold_f1", "first_retrieval_recall", "first_retrieval_hit_rate"]
     metric_labels = ["Gold Recall", "Gold F1", "First Ret. Recall", "First Ret. Hit Rate"]
     
-    # Calculate averages
     data = []
     for method in methods:
         method_results = results[method]
@@ -201,7 +183,6 @@ def plot_retrieval_quality(
         color = METHOD_COLORS.get(method, COLORS["neutral"])
         bars = ax.bar(x + offset, data[i], width, label=method, color=color, alpha=0.8)
         
-        # Add value labels on bars
         for bar, val in zip(bars, data[i]):
             height = bar.get_height()
             ax.annotate(f'{val:.2f}',
@@ -249,7 +230,6 @@ def plot_question_type_comparison(
         
         color = METHOD_COLORS.get(method_name, COLORS["neutral"])
         
-        # EM plot
         if comparison:
             comp_em = sum(r.get("em", 0) for r in comparison) / len(comparison)
             axes[0].bar(method_name + "\n(Comp)", comp_em, color=color, alpha=0.7)
@@ -257,7 +237,6 @@ def plot_question_type_comparison(
             bridge_em = sum(r.get("em", 0) for r in bridge) / len(bridge)
             axes[0].bar(method_name + "\n(Bridge)", bridge_em, color=color, alpha=0.4)
     
-    # Create grouped bar chart
     methods = list(results.keys())
     x = np.arange(len(methods))
     width = 0.35
@@ -286,7 +265,6 @@ def plot_question_type_comparison(
     axes[0].set_ylim(0, 1.05)
     axes[0].grid(True, alpha=0.3, axis='y')
     
-    # Add value labels
     for bar, val in zip(bars1, comp_f1):
         axes[0].annotate(f'{val:.2f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
@@ -294,7 +272,6 @@ def plot_question_type_comparison(
         axes[0].annotate(f'{val:.2f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
     
-    # Gold recall by question type
     comp_recall = []
     bridge_recall = []
     
@@ -344,7 +321,6 @@ def plot_efficiency_comparison(
     
     methods = list(results.keys())
     
-    # Calculate aggregates
     avg_f1 = []
     avg_tokens = []
     avg_time = []
@@ -368,7 +344,6 @@ def plot_efficiency_comparison(
     
     colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods]
     
-    # F1 Score comparison
     bars = axes[0].bar(methods, avg_f1, color=colors, alpha=0.8)
     axes[0].set_ylabel("Avg F1 Score")
     axes[0].set_title("Answer Quality")
@@ -377,7 +352,6 @@ def plot_efficiency_comparison(
         axes[0].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # Tokens comparison
     bars = axes[1].bar(methods, avg_tokens, color=colors, alpha=0.8)
     axes[1].set_ylabel("Avg Tokens/Question")
     axes[1].set_title("Token Usage")
@@ -385,7 +359,6 @@ def plot_efficiency_comparison(
         axes[1].annotate(f'{val:.0f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # Efficiency (F1 per 1K tokens)
     bars = axes[2].bar(methods, f1_per_1k, color=colors, alpha=0.8)
     axes[2].set_ylabel("F1 per 1K Tokens")
     axes[2].set_title("Efficiency (Higher = Better)")
@@ -442,7 +415,6 @@ def plot_answer_metrics(
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # Add value labels
     for bars in [bars1, bars2, bars3, bars4]:
         for bar in bars:
             height = bar.get_height()
@@ -479,7 +451,6 @@ def plot_supporting_facts_metrics(
     x = np.arange(len(methods))
     width = 0.6
     
-    # SP EM
     sp_em_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_em", 0) for m in methods]
     bars1 = axes[0].bar(methods, sp_em_vals, width, color=colors, alpha=0.8)
     axes[0].set_ylabel("Score")
@@ -491,7 +462,6 @@ def plot_supporting_facts_metrics(
         axes[0].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # SP F1
     sp_f1_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_f1", 0) for m in methods]
     bars2 = axes[1].bar(methods, sp_f1_vals, width, color=colors, alpha=0.8)
     axes[1].set_ylabel("Score")
@@ -535,7 +505,6 @@ def plot_joint_metrics(
     x = np.arange(len(methods))
     width = 0.6
     
-    # Joint EM
     joint_em_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_em", 0) for m in methods]
     bars1 = axes[0].bar(methods, joint_em_vals, width, color=colors, alpha=0.8)
     axes[0].set_ylabel("Score")
@@ -547,7 +516,6 @@ def plot_joint_metrics(
         axes[0].annotate(f'{val:.3f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                         xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # Joint F1
     joint_f1_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_f1", 0) for m in methods]
     bars2 = axes[1].bar(methods, joint_f1_vals, width, color=colors, alpha=0.8)
     axes[1].set_ylabel("Score")
@@ -586,7 +554,6 @@ def plot_metrics_summary(
     methods = list(aggregates.keys())
     colors = [METHOD_COLORS.get(m, COLORS["neutral"]) for m in methods]
     
-    # 1. Answer Quality (EM and F1)
     ax = axes[0, 0]
     x = np.arange(len(methods))
     width = 0.35
@@ -605,14 +572,12 @@ def plot_metrics_summary(
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # Add value labels
     for bars in [bars1, bars2]:
         for bar in bars:
             height = bar.get_height()
             ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
     
-    # 2. Supporting Facts (SP) Metrics
     ax = axes[0, 1]
     
     sp_em_vals = [aggregates[m].get("supporting_facts_metrics", {}).get("avg_sp_em", 0) for m in methods]
@@ -635,7 +600,6 @@ def plot_metrics_summary(
             ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
     
-    # 3. Joint Metrics (Answer AND SP both correct)
     ax = axes[0, 2]
     
     joint_em_vals = [aggregates[m].get("joint_metrics", {}).get("avg_joint_em", 0) for m in methods]
@@ -658,7 +622,6 @@ def plot_metrics_summary(
             ax.annotate(f'{height:.3f}', xy=(bar.get_x() + bar.get_width() / 2, height),
                        xytext=(0, 3), textcoords="offset points", ha='center', va='bottom', fontsize=9)
     
-    # 4. Retrieval Quality
     ax = axes[1, 0]
     
     gold_recall = [aggregates[m].get("retrieval_metrics", {}).get("avg_gold_recall", 0) for m in methods]
@@ -675,7 +638,6 @@ def plot_metrics_summary(
     ax.set_ylim(0, 1.05)
     ax.grid(True, alpha=0.3, axis='y')
     
-    # 5. Token Usage
     ax = axes[1, 1]
     
     avg_tokens = [aggregates[m].get("token_usage", {}).get("avg_tokens_per_question", 0) for m in methods]
@@ -689,7 +651,6 @@ def plot_metrics_summary(
         ax.annotate(f'{val:.0f}', xy=(bar.get_x() + bar.get_width() / 2, bar.get_height()),
                    xytext=(0, 3), textcoords="offset points", ha='center', va='bottom')
     
-    # 6. Efficiency
     ax = axes[1, 2]
     
     f1_per_1k = [aggregates[m].get("efficiency", {}).get("overall_f1_per_1k_tokens", 0) for m in methods]
@@ -711,10 +672,6 @@ def plot_metrics_summary(
     logger.info(f"Saved metrics summary plot to {output_path}")
     return output_path
 
-
-# =============================================================================
-# Main Visualization Generator
-# =============================================================================
 
 class VisualizationGenerator:
     """Generate all visualizations for experiment results."""
@@ -747,42 +704,34 @@ class VisualizationGenerator:
         
         plots = {}
         
-        # F1 vs Tokens
         path = str(self.plots_dir / "f1_vs_tokens.png")
         if plot_f1_vs_tokens(per_question_results, path, self.config):
             plots["f1_vs_tokens"] = path
         
-        # Retrieval Quality
         path = str(self.plots_dir / "retrieval_quality.png")
         if plot_retrieval_quality(per_question_results, path, self.config):
             plots["retrieval_quality"] = path
         
-        # Question Type Comparison
         path = str(self.plots_dir / "question_type_comparison.png")
         if plot_question_type_comparison(per_question_results, path, self.config):
             plots["question_type_comparison"] = path
         
-        # Efficiency Comparison
         path = str(self.plots_dir / "efficiency_comparison.png")
         if plot_efficiency_comparison(per_question_results, path, self.config):
             plots["efficiency_comparison"] = path
         
-        # Metrics Summary
         path = str(self.plots_dir / "metrics_summary.png")
         if plot_metrics_summary(aggregate_results, path, self.config):
             plots["metrics_summary"] = path
         
-        # Answer Metrics (comprehensive)
         path = str(self.plots_dir / "answer_metrics.png")
         if plot_answer_metrics(aggregate_results, path, self.config):
             plots["answer_metrics"] = path
         
-        # Supporting Facts Metrics
         path = str(self.plots_dir / "supporting_facts_metrics.png")
         if plot_supporting_facts_metrics(aggregate_results, path, self.config):
             plots["supporting_facts_metrics"] = path
         
-        # Joint Metrics
         path = str(self.plots_dir / "joint_metrics.png")
         if plot_joint_metrics(aggregate_results, path, self.config):
             plots["joint_metrics"] = path
@@ -804,7 +753,6 @@ class VisualizationGenerator:
         per_question_results = {}
         aggregate_results = {}
         
-        # Find all result directories
         for subdir in results_path.iterdir():
             if not subdir.is_dir():
                 continue

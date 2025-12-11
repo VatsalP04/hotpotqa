@@ -21,10 +21,6 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 import json
 
 
-# =============================================================================
-# Answer Normalization (Official HotpotQA style)
-# =============================================================================
-
 def normalize_answer(text: str) -> str:
     """
     Normalize answer string for evaluation (HotpotQA/SQuAD style).
@@ -38,24 +34,12 @@ def normalize_answer(text: str) -> str:
     if not text:
         return ""
     
-    # Lowercase
     text = text.lower()
-    
-    # Remove articles
     text = re.sub(r'\b(a|an|the)\b', ' ', text)
-    
-    # Remove punctuation
     text = ''.join(ch for ch in text if ch not in string.punctuation)
-    
-    # Normalize whitespace
     text = ' '.join(text.split())
     
     return text
-
-
-# =============================================================================
-# Core Answer Metrics
-# =============================================================================
 
 def exact_match(prediction: str, gold: str) -> float:
     """Calculate Exact Match score (1.0 if match, 0.0 otherwise)."""
@@ -73,16 +57,12 @@ def token_precision_recall_f1(prediction: str, gold: str) -> Dict[str, float]:
     normalized_pred = normalize_answer(prediction)
     normalized_gold = normalize_answer(gold)
     
-    # Special handling for yes/no/noanswer (exact match only)
-    # If prediction is yes/no/noanswer and doesn't match gold, return 0
     if normalized_pred in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     
-    # If gold is yes/no/noanswer and doesn't match prediction, return 0
     if normalized_gold in ['yes', 'no', 'noanswer'] and normalized_pred != normalized_gold:
         return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
     
-    # Token-level F1 for other answers
     pred_tokens = normalized_pred.split()
     gold_tokens = normalized_gold.split()
     
@@ -108,10 +88,6 @@ def f1_score(prediction: str, gold: str) -> float:
     """Calculate token-level F1 score."""
     return token_precision_recall_f1(prediction, gold)["f1"]
 
-
-# =============================================================================
-# Retrieval Quality Metrics
-# =============================================================================
 
 def retrieval_precision_recall_f1(
     retrieved_titles: List[str],
@@ -230,10 +206,6 @@ def supporting_facts_metrics(
     }
 
 
-# =============================================================================
-# Token Efficiency Metrics
-# =============================================================================
-
 def token_efficiency_metrics(
     f1: float,
     em: float,
@@ -250,7 +222,6 @@ def token_efficiency_metrics(
     """
     total_tokens = input_tokens + output_tokens
     
-    # Avoid division by zero
     if total_tokens == 0:
         return {
             "f1_per_1k_tokens": 0.0,
@@ -262,73 +233,58 @@ def token_efficiency_metrics(
         "f1_per_1k_tokens": (f1 * 1000) / total_tokens,
         "em_per_1k_tokens": (em * 1000) / total_tokens,
         "tokens_per_correct": total_tokens / em if em > 0 else float('inf'),
-    }
+        }
 
-
-# =============================================================================
-# Data Classes for Results
-# =============================================================================
 
 @dataclass
 class QuestionMetrics:
     """Complete metrics for a single question."""
     question_id: str
     question: str
-    question_type: str  # "comparison" or "bridge"
+    question_type: str
     
-    # Answers
     gold_answer: str
     predicted_answer: str
     
-    # Core answer metrics
     em: float
     f1: float
     precision: float
     recall: float
     
-    # Retrieval info
     retrieved_titles: List[str]
     first_retrieved_titles: List[str]
     gold_titles: Set[str]
     num_retrieval_steps: int
     num_paragraphs_retrieved: int
     
-    # Retrieval metrics
     gold_recall: float
     gold_precision: float
     gold_f1: float
     gold_hit_rate: float
     
-    # First retrieval metrics
     first_retrieval_recall: float
     first_retrieval_precision: float
     first_retrieval_f1: float
     first_retrieval_hit_rate: float
     
-    # Token usage
     input_tokens: int
     output_tokens: int
     total_tokens: int
     
-    # Efficiency
     f1_per_1k_tokens: float
     em_per_1k_tokens: float
     
-    # Supporting Facts (SP) metrics (official HotpotQA)
-    sp_em: float  # Exact match: all supporting fact titles retrieved
-    sp_f1: float  # F1 of supporting fact titles (same as gold_f1)
+    sp_em: float
+    sp_f1: float
     
-    # Joint metrics (official HotpotQA)
-    joint_em: float  # Answer EM AND SP EM both correct
-    joint_f1: float  # Answer F1 * SP F1
+    joint_em: float
+    joint_f1: float
     
-    # Timing
     processing_time: float
     
-    # Extra info
     reasoning_chain: str = ""
     error: Optional[str] = None
-    extra: Dict[str, Any] = field(default_factory=dict)  # For method-specific details
+    extra: Dict[str, Any] = field(default_factory=dict)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -367,7 +323,7 @@ class QuestionMetrics:
             "processing_time": self.processing_time,
             "reasoning_chain": self.reasoning_chain,
             "error": self.error,
-            "extra": self.extra,  # Include method-specific details (NOT_FOUND, search queries, etc.)
+            "extra": self.extra,
         }
 
 
@@ -378,53 +334,43 @@ class AggregateMetrics:
     num_questions: int
     num_errors: int
     
-    # Answer metrics (macro averaged)
     avg_em: float
     avg_f1: float
     avg_precision: float
     avg_recall: float
     
-    # Retrieval metrics (macro averaged)
     avg_gold_recall: float
     avg_gold_precision: float
     avg_gold_f1: float
     avg_gold_hit_rate: float
     
-    # First retrieval metrics
     avg_first_retrieval_recall: float
     avg_first_retrieval_precision: float
     avg_first_retrieval_f1: float
     avg_first_retrieval_hit_rate: float
     
-    # Retrieval stats
     avg_retrieval_steps: float
     avg_paragraphs_retrieved: float
     
-    # Token usage
     total_input_tokens: int
     total_output_tokens: int
     total_tokens: int
     avg_tokens_per_question: float
     
-    # Efficiency
     avg_f1_per_1k_tokens: float
     avg_em_per_1k_tokens: float
-    overall_f1_per_1k_tokens: float  # F1 / (total_tokens / 1000)
+    overall_f1_per_1k_tokens: float
     
-    # Supporting Facts (SP) metrics (official HotpotQA)
     avg_sp_em: float
     avg_sp_f1: float
     
-    # Joint metrics (official HotpotQA)
     avg_joint_em: float
     avg_joint_f1: float
     
-    # Timing
     total_time: float
     avg_time_per_question: float
     
-    # Optional fields (with defaults)
-    not_found_count: int = 0  # For decomposition: questions using NOT_FOUND fallback
+    not_found_count: int = 0
     comparison_metrics: Optional[Dict[str, float]] = None
     bridge_metrics: Optional[Dict[str, float]] = None
     
@@ -500,10 +446,6 @@ class AggregateMetrics:
         return result
 
 
-# =============================================================================
-# Metrics Calculator
-# =============================================================================
-
 class MetricsCalculator:
     """Calculate comprehensive metrics from method results."""
     
@@ -526,31 +468,22 @@ class MetricsCalculator:
     ) -> QuestionMetrics:
         """Calculate all metrics for a single question."""
         
-        # Answer metrics
         em = exact_match(predicted_answer, gold_answer)
         prf = token_precision_recall_f1(predicted_answer, gold_answer)
         
-        # Retrieval metrics
         retrieval_prf = retrieval_precision_recall_f1(retrieved_titles, gold_titles)
         hit_rate = gold_paragraph_hit_rate(retrieved_titles, gold_titles)
         
-        # First retrieval metrics
         first_prf = retrieval_precision_recall_f1(first_retrieved_titles, gold_titles)
         first_hit_rate = gold_paragraph_hit_rate(first_retrieved_titles, gold_titles)
         
-        # Supporting Facts (SP) metrics (official HotpotQA)
-        # SP EM: 1.0 if all gold titles are retrieved, 0.0 otherwise
         retrieved_set = set(retrieved_titles)
         sp_em = 1.0 if gold_titles and gold_titles.issubset(retrieved_set) else 0.0
-        sp_f1 = retrieval_prf["f1"]  # SP F1 is same as gold_f1
+        sp_f1 = retrieval_prf["f1"]
         
-        # Joint metrics (official HotpotQA)
-        # Joint EM: Answer EM AND SP EM both correct
         joint_em = em * sp_em
-        # Joint F1: Answer F1 * SP F1
         joint_f1 = prf["f1"] * sp_f1
         
-        # Token efficiency
         total_tokens = input_tokens + output_tokens
         efficiency = token_efficiency_metrics(prf["f1"], em, input_tokens, output_tokens)
         
@@ -619,10 +552,8 @@ class MetricsCalculator:
         
         num_errors = sum(1 for r in results if r.error)
         
-        # Track NOT_FOUND for decomposition
         not_found_count = sum(1 for r in results if r.extra.get("not_found_count", 0) > 0)
         
-        # Averages
         avg_em = sum(r.em for r in results) / n
         avg_f1 = sum(r.f1 for r in results) / n
         avg_precision = sum(r.precision for r in results) / n
@@ -638,33 +569,27 @@ class MetricsCalculator:
         avg_first_f1 = sum(r.first_retrieval_f1 for r in results) / n
         avg_first_hit_rate = sum(r.first_retrieval_hit_rate for r in results) / n
         
-        # Supporting Facts (SP) metrics
         avg_sp_em = sum(r.sp_em for r in results) / n
         avg_sp_f1 = sum(r.sp_f1 for r in results) / n
         
-        # Joint metrics
         avg_joint_em = sum(r.joint_em for r in results) / n
         avg_joint_f1 = sum(r.joint_f1 for r in results) / n
         
         avg_retrieval_steps = sum(r.num_retrieval_steps for r in results) / n
         avg_paragraphs = sum(r.num_paragraphs_retrieved for r in results) / n
         
-        # Tokens
         total_input = sum(r.input_tokens for r in results)
         total_output = sum(r.output_tokens for r in results)
         total_tokens = total_input + total_output
         avg_tokens = total_tokens / n
         
-        # Efficiency
         avg_f1_per_1k = sum(r.f1_per_1k_tokens for r in results) / n
         avg_em_per_1k = sum(r.em_per_1k_tokens for r in results) / n
         overall_f1_per_1k = (avg_f1 * 1000) / avg_tokens if avg_tokens > 0 else 0.0
         
-        # Timing
         total_time = sum(r.processing_time for r in results)
         avg_time = total_time / n
         
-        # By question type
         comparison_results = [r for r in results if r.question_type == "comparison"]
         bridge_results = [r for r in results if r.question_type == "bridge"]
         
@@ -726,10 +651,6 @@ class MetricsCalculator:
         )
 
 
-# =============================================================================
-# Report Generation
-# =============================================================================
-
 def generate_markdown_report(
     aggregate: AggregateMetrics,
     per_question: List[QuestionMetrics],
@@ -746,7 +667,6 @@ def generate_markdown_report(
         f"**Errors**: {aggregate.num_errors}",
     ]
     
-    # Add NOT_FOUND count for decomposition
     if aggregate.not_found_count > 0:
         pct = (aggregate.not_found_count / aggregate.num_questions * 100) if aggregate.num_questions > 0 else 0.0
         lines.append(f"**NOT_FOUND Fallback Used**: {aggregate.not_found_count} questions ({pct:.1f}%)")
@@ -802,7 +722,6 @@ def generate_markdown_report(
         "",
     ])
     
-    # By question type
     if aggregate.comparison_metrics or aggregate.bridge_metrics:
         lines.extend([
             "---",
@@ -823,7 +742,6 @@ def generate_markdown_report(
         
         lines.append("")
     
-    # Error analysis
     errors = [r for r in per_question if r.error]
     if errors:
         lines.extend([
@@ -841,7 +759,6 @@ def generate_markdown_report(
     
     report = "\n".join(lines)
     
-    # Save report
     with open(output_path, "w") as f:
         f.write(report)
     

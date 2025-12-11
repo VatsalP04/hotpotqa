@@ -161,19 +161,21 @@ def run_comparison(args):
     logger.info(f"Retrieval: {'Dense (embeddings)' if args.use_dense else 'BM25 (lexical)'}")
     logger.info("="*60)
     
-    # Create runner
+    # Create runner with checkpointing (every 100 questions by default)
     runner = ExperimentRunner(
         data_path=args.data_path,
         output_dir=args.output_dir,
         num_samples=args.num_samples,
         seed=args.seed,
         generate_plots=not args.no_plots,
+        checkpoint_interval=100,  # Save checkpoint every 100 questions
     )
     
     # Create adapters (all use BM25 by default unless --use_dense is set)
     adapters = {}
     retrieval_type = "DENSE (embeddings)" if args.use_dense else "BM25 (lexical)"
     logger.info(f"📌 All methods will use: {retrieval_type} retrieval")
+    logger.info("💾 Checkpointing enabled - can stop anytime with Ctrl+C and resume later")
     logger.info("")
     
     for method in args.methods:
@@ -198,8 +200,8 @@ def run_comparison(args):
         logger.error("No valid methods specified")
         return
     
-    # Run comparison
-    runner.compare_methods(adapters)
+    # Run comparison (with resume enabled by default)
+    runner.compare_methods(adapters, resume=True)
     
 
 def run_single(args):

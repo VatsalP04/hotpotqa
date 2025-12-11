@@ -24,10 +24,6 @@ from .types import Context, EmbeddingsProtocol, Paragraph, RetrievalResult
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Retriever Protocol (Interface)
-# =============================================================================
-
 @runtime_checkable
 class RetrieverProtocol(Protocol):
     """Protocol that any retriever must implement."""
@@ -58,10 +54,6 @@ class RetrieverProtocol(Protocol):
         """Clear indexed paragraphs."""
         ...
 
-
-# =============================================================================
-# BM25 Retriever (Default - No API calls)
-# =============================================================================
 
 class BM25Retriever:
     """
@@ -103,7 +95,6 @@ class BM25Retriever:
     @staticmethod
     def _default_tokenizer(text: str) -> List[str]:
         """Simple tokenizer: lowercase, split on non-alphanumeric, remove stopwords."""
-        # Common English stopwords
         stopwords = {
             'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
             'of', 'with', 'by', 'from', 'is', 'are', 'was', 'were', 'be', 'been',
@@ -116,10 +107,7 @@ class BM25Retriever:
             'too', 'very', 'as', 'if', 'then', 'because', 'while', 'although',
         }
         
-        # Lowercase and split on non-alphanumeric
         tokens = re.findall(r'\b[a-z0-9]+\b', text.lower())
-        
-        # Remove stopwords and short tokens
         return [t for t in tokens if t not in stopwords and len(t) > 1]
     
     def index(self, context: Context) -> None:
@@ -133,16 +121,13 @@ class BM25Retriever:
             paragraph = Paragraph.from_context_item(title, sentences, idx)
             self._paragraphs.append(paragraph)
             
-            # Get text and tokenize
             text = paragraph.full_text if self._include_title else paragraph.text
             tokens = self._tokenizer(text)
             
-            # Count term frequencies for this document
             term_freqs = Counter(tokens)
             self._doc_term_freqs.append(term_freqs)
             self._doc_lens.append(len(tokens))
             
-            # Update document frequencies
             for term in set(tokens):
                 self._doc_freqs[term] += 1
         
@@ -164,47 +149,38 @@ class BM25Retriever:
             logger.warning("No paragraphs indexed for retrieval")
             return []
         
-        # Tokenize query
         query_tokens = self._tokenizer(query)
         if not query_tokens:
             logger.debug("Empty query after tokenization")
             return []
         
-        # Calculate BM25 scores for all documents
         scores = np.zeros(self._num_docs)
         
         for term in query_tokens:
             if term not in self._doc_freqs:
                 continue
             
-            # IDF component
             df = self._doc_freqs[term]
             idf = math.log((self._num_docs - df + 0.5) / (df + 0.5) + 1)
             
-            # Score each document
             for doc_idx in range(self._num_docs):
                 tf = self._doc_term_freqs[doc_idx].get(term, 0)
                 if tf == 0:
                     continue
                 
                 doc_len = self._doc_lens[doc_idx]
-                
-                # BM25 term score
                 numerator = tf * (self._k1 + 1)
                 denominator = tf + self._k1 * (1 - self._b + self._b * doc_len / self._avg_doc_len)
                 scores[doc_idx] += idf * (numerator / denominator)
         
-        # Apply exclusion mask
         if exclude_indices:
             for idx in exclude_indices:
                 if 0 <= idx < len(scores):
                     scores[idx] = -np.inf
         
-        # Get top-k indices
         k = min(k, self._num_docs)
         top_indices = np.argsort(scores)[-k:][::-1]
         
-        # Build results
         results = []
         for rank, idx in enumerate(top_indices):
             score = scores[idx]
@@ -238,10 +214,6 @@ class BM25Retriever:
         self._indexed = False
         self._num_docs = 0
 
-
-# =============================================================================
-# Dense Retriever (Embedding-based)
-# =============================================================================
 
 class DenseRetriever:
     """
@@ -295,23 +267,17 @@ class DenseRetriever:
             logger.warning("No paragraphs indexed for retrieval")
             return []
         
-        # Get query embedding
         query_emb = self._embeddings.embed_text(query)
-        
-        # Calculate similarities
         similarities = self._cosine_similarity(query_emb, self._embeddings_matrix)
         
-        # Apply exclusion mask
         if exclude_indices:
             for idx in exclude_indices:
                 if 0 <= idx < len(similarities):
                     similarities[idx] = -np.inf
         
-        # Get top-k indices
         k = min(k, len(self._paragraphs))
         top_indices = np.argsort(similarities)[-k:][::-1]
         
-        # Build results
         results = []
         for rank, idx in enumerate(top_indices):
             score = similarities[idx]
@@ -360,10 +326,6 @@ class DenseRetriever:
         self._indexed = False
 
 
-# =============================================================================
-# Retrieval History Tracking
-# =============================================================================
-
 @dataclass
 class RetrievalHistoryEntry:
     """Records a single retrieval operation."""
@@ -374,13 +336,8 @@ class RetrievalHistoryEntry:
     scores: List[float]
 
 
-# Type alias for any base retriever
 BaseRetriever = Union[BM25Retriever, DenseRetriever]
 
-
-# =============================================================================
-# IRCoT Retriever (Stateful wrapper)
-# =============================================================================
 
 class IRCoTRetriever:
     """
@@ -423,7 +380,6 @@ class IRCoTRetriever:
         results = self._base.retrieve(question, k)
         new_paragraphs = self._add_results(results)
         
-        # Track first retrieval titles for metrics
         self._first_retrieval_titles = [p.title for p in new_paragraphs]
         
         self._history.append(RetrievalHistoryEntry(
@@ -444,16 +400,13 @@ class IRCoTRetriever:
         step_number: Optional[int] = None
     ) -> List[Paragraph]:
         """Retrieve additional paragraphs using a CoT sentence."""
-        # Check if we've reached max
         if len(self._retrieved) >= self._max_paragraphs:
             logger.debug("Max paragraphs reached, skipping retrieval")
             return []
         
-        # Limit k to remaining capacity
         remaining = self._max_paragraphs - len(self._retrieved)
         k = min(k, remaining)
         
-        # Retrieve excluding already-retrieved paragraphs
         results = self._base.retrieve(
             cot_sentence,
             k,
@@ -525,10 +478,6 @@ class IRCoTRetriever:
             "first_retrieval_titles": self._first_retrieval_titles,
         }
 
-
-# =============================================================================
-# Factory Function
-# =============================================================================
 
 def create_retriever(
     retriever_type: str = "bm25",

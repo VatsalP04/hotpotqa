@@ -28,28 +28,19 @@ from src.reasoning.core.visualization import VisualizationGenerator
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# Result Data Classes
-# =============================================================================
-
 @dataclass
 class MethodResult:
     """Result from a single method run (returned by adapters)."""
     answer: str
     reasoning_chain: str = ""
     retrieved_titles: List[str] = field(default_factory=list)
-    first_retrieved_titles: List[str] = field(default_factory=list)  # First retrieval step
+    first_retrieved_titles: List[str] = field(default_factory=list)
     num_retrieval_steps: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     embedding_tokens: int = 0
     processing_time: float = 0.0
     extra: Dict[str, Any] = field(default_factory=dict)
-
-
-# =============================================================================
-# Experiment Runner
-# =============================================================================
 
 class ExperimentRunner:
     """
@@ -69,6 +60,7 @@ class ExperimentRunner:
         num_samples: Optional[int] = None,
         seed: int = 42,
         generate_plots: bool = True,
+        checkpoint_interval: int = 100,
     ):
         """
         Initialize experiment runner.
@@ -79,6 +71,7 @@ class ExperimentRunner:
             num_samples: Number of samples to use (None = all)
             seed: Random seed
             generate_plots: Whether to generate visualization plots
+            checkpoint_interval: Save checkpoint every N questions (default: 100)
         """
         self.data_path = data_path
         self.output_dir = Path(output_dir)
@@ -86,6 +79,7 @@ class ExperimentRunner:
         self.num_samples = num_samples
         self.seed = seed
         self.generate_plots = generate_plots
+        self.checkpoint_interval = checkpoint_interval
         
         # Load data
         self.data = load_hotpotqa_json(
@@ -96,6 +90,8 @@ class ExperimentRunner:
         )
         
         logger.info(f"Loaded {len(self.data)} examples")
+        if checkpoint_interval > 0:
+            logger.info(f"Checkpointing enabled: saving every {checkpoint_interval} questions")
     
     def _get_gold_titles(self, example: Dict) -> Set[str]:
         """Extract gold paragraph titles from supporting facts."""
@@ -110,10 +106,45 @@ class ExperimentRunner:
         
         return gold_titles
     
+    def _get_checkpoint_path(self, method_name: str) -> Path:
+        """Get path for checkpoint file."""
+        checkpoint_dir = self.output_dir / "checkpoints"
+        checkpoint_dir.mkdir(exist_ok=True)
+        return checkpoint_dir / f"{method_name}_checkpoint.json"
+    
+    def _load_checkpoint(self, method_name: str) -> Optional[List[QuestionMetrics]]:
+        """Load existing checkpoint if available."""
+        checkpoint_path = self._get_checkpoint_path(method_name)
+        if checkpoint_path.exists():
+            try:
+                with open(checkpoint_path) as f:
+                    data = json.load(f)
+                    results = []
+                    for item in data:
+                        if "gold_titles" in item and isinstance(item["gold_titles"], list):
+                            item["gold_titles"] = set(item["gold_titles"])
+                        results.append(QuestionMetrics(**item))
+                    logger.info(f"📂 Loaded checkpoint: {len(results)} questions already processed")
+                    return results
+            except Exception as e:
+                logger.warning(f"Failed to load checkpoint: {e}")
+        return None
+    
+    def _save_checkpoint(self, method_name: str, results: List[QuestionMetrics]) -> None:
+        """Save checkpoint."""
+        checkpoint_path = self._get_checkpoint_path(method_name)
+        try:
+            with open(checkpoint_path, "w") as f:
+                json.dump([r.to_dict() for r in results], f, indent=2)
+            logger.info(f"💾 Checkpoint saved: {len(results)} questions ({checkpoint_path})")
+        except Exception as e:
+            logger.warning(f"Failed to save checkpoint: {e}")
+    
     def run_method(
         self,
         adapter,
         method_name: str,
+        resume: bool = True,
     ) -> List[QuestionMetrics]:
         """
         Run a method on all questions with comprehensive metrics.
@@ -121,13 +152,22 @@ class ExperimentRunner:
         Args:
             adapter: Method adapter with answer() method
             method_name: Name of the method
+            resume: If True, resume from checkpoint if available
         
         Returns:
             List of QuestionMetrics objects
         """
+        # Try to load checkpoint
         results = []
+        start_idx = 0
+        if resume:
+            checkpoint_results = self._load_checkpoint(method_name)
+            if checkpoint_results:
+                results = checkpoint_results
+                start_idx = len(results)
+                logger.info(f"🔄 Resuming from question {start_idx + 1}/{len(self.data)}")
         
-        for i, example in enumerate(self.data):
+        for i, example in enumerate(self.data[start_idx:], start=start_idx):
             question_id = example.get("_id", str(i))
             question = example.get("question", "")
             gold_answer = example.get("answer", "")
@@ -151,20 +191,16 @@ class ExperimentRunner:
                 error = str(e)
                 method_result = MethodResult(answer="")
             
-            # Extract extra info (NOT_FOUND, search queries, etc.)
             extra_info = method_result.extra if method_result else {}
             not_found_count = extra_info.get("not_found_count", 0)
             search_queries = extra_info.get("all_search_queries", [])
             sub_qas = extra_info.get("sub_qas", [])
             
-            # Build detailed reasoning chain with search queries
             detailed_reasoning = method_result.reasoning_chain if method_result else ""
             if search_queries and detailed_reasoning:
-                # Add search queries info if not already included
                 if "Search Queries:" not in detailed_reasoning:
                     detailed_reasoning += f"\n\nSearch Queries Used: {', '.join(search_queries)}"
             
-            # Calculate comprehensive metrics
             metrics = MetricsCalculator.calculate_question_metrics(
                     question_id=question_id,
                     question=question,
@@ -191,10 +227,19 @@ class ExperimentRunner:
             
             results.append(metrics)
             
-            # Log progress
             logger.info(f"  → Answer: {metrics.predicted_answer[:50]}... | "
                        f"EM: {metrics.em:.2f}, F1: {metrics.f1:.2f}, "
                        f"GoldRecall: {metrics.gold_recall:.2f}")
+            
+            if self.checkpoint_interval > 0 and (i + 1) % self.checkpoint_interval == 0:
+                self._save_checkpoint(method_name, results)
+                completed = len(results)
+                total = len(self.data)
+                pct = (completed / total) * 100
+                logger.info(f"📊 Progress: {completed}/{total} ({pct:.1f}%) - Checkpoint saved")
+        
+        if self.checkpoint_interval > 0:
+            self._save_checkpoint(method_name, results)
         
         return results
     
@@ -209,18 +254,14 @@ class ExperimentRunner:
         output_path = self.output_dir / f"{method_name}_{timestamp}"
         output_path.mkdir(parents=True, exist_ok=True)
         
-        # Save per-question results
         with open(output_path / "per_question.json", "w") as f:
             json.dump([r.to_dict() for r in results], f, indent=2)
         
-        # Save detailed per-question report
         self._save_detailed_per_question_report(results, output_path / "detailed_per_question.md")
         
-        # Save aggregate summary
         with open(output_path / "summary.json", "w") as f:
             json.dump(aggregate.to_dict(), f, indent=2)
         
-        # Generate markdown report
         generate_markdown_report(
             aggregate,
             results,
@@ -233,12 +274,14 @@ class ExperimentRunner:
     def compare_methods(
         self,
         adapters: Dict[str, Any],
+        resume: bool = True,
     ) -> Dict[str, AggregateMetrics]:
         """
         Compare multiple methods and generate comprehensive analysis.
         
         Args:
             adapters: Dict mapping method names to adapters
+            resume: If True, resume from checkpoints if available
         
         Returns:
             Dict mapping method names to aggregate metrics
@@ -246,11 +289,10 @@ class ExperimentRunner:
         all_results: Dict[str, List[QuestionMetrics]] = {}
         all_aggregates: Dict[str, AggregateMetrics] = {}
         
-        # Run each method
         for method_name, adapter in adapters.items():
             logger.info(f"\n{'='*60}\nRunning {method_name}\n{'='*60}")
             
-            results = self.run_method(adapter, method_name)
+            results = self.run_method(adapter, method_name, resume=resume)
             aggregate = MetricsCalculator.aggregate_metrics(results, method_name)
             
             self.save_results(results, aggregate, method_name)
@@ -258,10 +300,8 @@ class ExperimentRunner:
             all_results[method_name] = results
             all_aggregates[method_name] = aggregate
         
-        # Print comparison
         self._print_comparison(all_aggregates)
         
-        # Generate combined report and visualizations
         self._generate_comparison_outputs(all_results, all_aggregates)
         
         return all_aggregates
@@ -296,7 +336,6 @@ class ExperimentRunner:
         comparison_dir = self.output_dir / f"comparison_{timestamp}"
         comparison_dir.mkdir(parents=True, exist_ok=True)
         
-        # Convert to serializable format
         per_question_dict = {
             method: [r.to_dict() for r in results]
             for method, results in all_results.items()
@@ -307,17 +346,14 @@ class ExperimentRunner:
             for method, agg in all_aggregates.items()
         }
         
-        # Save combined results
         with open(comparison_dir / "all_per_question.json", "w") as f:
             json.dump(per_question_dict, f, indent=2)
         
         with open(comparison_dir / "all_summaries.json", "w") as f:
             json.dump(aggregate_dict, f, indent=2)
         
-        # Generate combined markdown report
         self._generate_comparison_report(all_aggregates, comparison_dir / "comparison_report.md")
         
-        # Generate visualizations
         if self.generate_plots:
             logger.info("Generating visualization plots...")
             viz = VisualizationGenerator(str(comparison_dir))
@@ -328,7 +364,7 @@ class ExperimentRunner:
                 for name, path in plots.items():
                     logger.info(f"  - {name}: {path}")
         
-        logger.info(f"\n✅ Comparison results saved to: {comparison_dir}")
+        logger.info(f"\n Comparison results saved to: {comparison_dir}")
     
     def _generate_comparison_report(
         self,
@@ -494,9 +530,9 @@ class ExperimentRunner:
                                 f"- **Re-Attempt Answer**: {sub_qa.get('reattempt_answer', 'N/A')}",
                             ])
                             if sub_qa.get('reattempt_answer') and sub_qa['reattempt_answer'].strip().upper() != "NOT_FOUND":
-                                lines.append(f"- **Status**: ✅ Success (used as final answer)")
+                                lines.append(f"- **Status**: Success (used as final answer)")
                             else:
-                                lines.append(f"- **Status**: ❌ Still NOT_FOUND")
+                                lines.append(f"- **Status**:  Still NOT_FOUND")
                     else:
                         # No re-attempt needed
                         lines.extend([

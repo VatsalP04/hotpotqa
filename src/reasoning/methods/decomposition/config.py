@@ -10,39 +10,85 @@ from typing import List, Optional
 class DecompositionConfig:
     """Configuration for decomposition-based reasoning."""
     
-    # Retrieval
-    k_retrieve: int = 2  # Paragraphs per sub-question retrieval
-    max_sub_questions: int = 5  # Maximum sub-questions
+    k_retrieve: int = 2
+    max_sub_questions: int = 5
     
-    # LLM generation
     temperature: float = 0.2
-    max_tokens_subq: int = 100  # For generating sub-questions
-    max_tokens_suba: int = 50   # For generating sub-answers
-    max_tokens_final: int = 100  # For final answer
+    max_tokens_subq: int = 100
+    max_tokens_suba: int = 50
+    max_tokens_final: int = 100
 
-    # Fallback behavior (for ablation studies)
-    enable_search_query_fallback: bool = True  # Generate new search query on NOT_FOUND
-    enable_relaxed_prompt_fallback: bool = True  # Use relaxed prompt (no NOT_FOUND option) after reattempt fails
+    use_relaxed_prompt_initial: bool = False
     
-    # Self-consistency
+    enable_search_query_fallback: bool = True
+    enable_relaxed_prompt_fallback: bool = True
+    
     self_consistency_enabled: bool = False
     self_consistency_num_samples: int = 1
     self_consistency_temperatures: List[float] = field(default_factory=lambda: [0.6])
     
     @classmethod
-    def full_pipeline(cls) -> "DecompositionConfig":
-        """Full pipeline: search query fallback + relaxed prompt fallback."""
+    def relaxed_initial(cls) -> "DecompositionConfig":
+        """
+        Ablation: Use relaxed prompt (no NOT_FOUND option) as initial answering.
+        No fallbacks needed since we always get an answer.
+        """
         return cls(
-            enable_search_query_fallback=True,
+            use_relaxed_prompt_initial=True,
+            enable_search_query_fallback=False,
+            enable_relaxed_prompt_fallback=False,
+            self_consistency_enabled=False,
+        )
+    
+    @classmethod
+    def notfound_no_fallback(cls) -> "DecompositionConfig":
+        """
+        Ablation: Use NOT_FOUND prompt, no fallbacks.
+        If NOT_FOUND is returned, keep it as the answer.
+        """
+        return cls(
+            use_relaxed_prompt_initial=False,
+            enable_search_query_fallback=False,
+            enable_relaxed_prompt_fallback=False,
+            self_consistency_enabled=False,
+        )
+    
+    @classmethod
+    def notfound_direct_relaxed(cls) -> "DecompositionConfig":
+        """
+        Ablation: Use NOT_FOUND prompt, directly fallback to relaxed prompt.
+        If NOT_FOUND -> use relaxed prompt (no search query in between).
+        """
+        return cls(
+            use_relaxed_prompt_initial=False,
+            enable_search_query_fallback=False,
             enable_relaxed_prompt_fallback=True,
             self_consistency_enabled=False,
         )
     
     @classmethod
-    def relaxed_only(cls) -> "DecompositionConfig":
-        """Relaxed prompt only: skip search query, directly use relaxed prompt on NOT_FOUND."""
+    def notfound_with_search_fallback(cls) -> "DecompositionConfig":
+        """
+        Ablation: Use NOT_FOUND prompt, fallback with search query rewrite only.
+        If NOT_FOUND -> generate search query -> reattempt with NOT_FOUND prompt.
+        No relaxed prompt fallback.
+        """
         return cls(
-            enable_search_query_fallback=False,
+            use_relaxed_prompt_initial=False,
+            enable_search_query_fallback=True,
+            enable_relaxed_prompt_fallback=False,
+            self_consistency_enabled=False,
+        )
+    
+    @classmethod
+    def full_pipeline(cls) -> "DecompositionConfig":
+        """
+        Ablation: Full pipeline with all fallbacks.
+        NOT_FOUND prompt -> search query fallback -> relaxed prompt fallback.
+        """
+        return cls(
+            use_relaxed_prompt_initial=False,
+            enable_search_query_fallback=True,
             enable_relaxed_prompt_fallback=True,
             self_consistency_enabled=False,
         )
@@ -51,19 +97,11 @@ class DecompositionConfig:
     def full_with_self_consistency(cls, num_samples: int = 5, temperature: float = 0.6) -> "DecompositionConfig":
         """Full pipeline + self-consistency."""
         return cls(
+            use_relaxed_prompt_initial=False,
             enable_search_query_fallback=True,
             enable_relaxed_prompt_fallback=True,
             self_consistency_enabled=True,
             self_consistency_num_samples=num_samples,
             self_consistency_temperatures=[temperature],
-        )
-    
-    @classmethod
-    def no_fallback(cls) -> "DecompositionConfig":
-        """No fallback: just use NOT_FOUND as answer if not found."""
-        return cls(
-            enable_search_query_fallback=False,
-            enable_relaxed_prompt_fallback=False,
-            self_consistency_enabled=False,
         )
 

@@ -18,20 +18,14 @@ from typing import Optional, Sequence, Dict, List, Any
 
 logger = logging.getLogger(__name__)
 
-# LangSmith integration (optional)
 try:
     from langsmith import traceable
     from langsmith.run_helpers import tracing_context
     LANGSMITH_AVAILABLE = True
 except ImportError:
     LANGSMITH_AVAILABLE = False
-    traceable = lambda **kwargs: lambda f: f  # No-op decorator
-    tracing_context = lambda: None  # No-op context manager
-
-
-# =============================================================================
-# Token Usage Tracking
-# =============================================================================
+    traceable = lambda **kwargs: lambda f: f
+    tracing_context = lambda: None
 
 @dataclass
 class TokenUsage:
@@ -93,10 +87,6 @@ class UsageTracker:
         self._current_question_usages = []
 
 
-# =============================================================================
-# LLM Client Interface
-# =============================================================================
-
 class LLMClient(ABC):
     """Abstract base class for language model clients."""
     
@@ -142,10 +132,9 @@ class MistralLLMClient(LLMClient):
         
         self._model = model
         self._system_instruction = system_instruction
-        self._client = None  # Lazy initialization
+        self._client = None
         self._usage_tracker = UsageTracker()
         
-        # LangSmith configuration
         self._langsmith_enabled = (
             LANGSMITH_AVAILABLE and 
             os.environ.get("LANGSMITH_TRACING", "false").lower() == "true"
@@ -193,12 +182,10 @@ class MistralLLMClient(LLMClient):
             
             text = response.choices[0].message.content
             
-            # Extract native token usage from Mistral response
             prompt_tokens = getattr(response.usage, "prompt_tokens", 0) if hasattr(response, "usage") else 0
             completion_tokens = getattr(response.usage, "completion_tokens", 0) if hasattr(response, "usage") else 0
             total_tokens = getattr(response.usage, "total_tokens", 0) if hasattr(response, "usage") else 0
             
-            # Fallback to estimation
             if prompt_tokens == 0 and completion_tokens == 0:
                 prompt_tokens = self._estimate_tokens("\n".join(m["content"] for m in messages))
                 completion_tokens = self._estimate_tokens(text)
@@ -213,7 +200,6 @@ class MistralLLMClient(LLMClient):
             )
             self._usage_tracker.log(usage)
             
-            # Apply stop sequences (in case API didn't handle them)
             if stop:
                 for token in stop:
                     idx = text.find(token)
@@ -252,7 +238,6 @@ class MistralLLMClient(LLMClient):
             "content": prompt
         })
         
-        # Prepare LangSmith metadata and tags
         langsmith_metadata = {
             "model": self._model,
             "temperature": temperature,
@@ -263,21 +248,17 @@ class MistralLLMClient(LLMClient):
         
         langsmith_tags = tags or ["mistral", "generation"]
         
-        # Use LangSmith tracing if enabled
         if self._langsmith_enabled:
-            # Prepare inputs for LangSmith - these will be visible in the trace
-            # Include full prompt and messages (not truncated) so you can see everything
             langsmith_inputs = {
-                "prompt": prompt,  # Full prompt
+                "prompt": prompt,
                 "system_instruction": self._system_instruction or "",
-                "messages": messages,  # Full messages array
+                "messages": messages,
                 "temperature": temperature,
                 "max_new_tokens": max_new_tokens,
                 "stop": list(stop) if stop else None,
                 "model": self._model,
             }
             
-            # Use traceable with inputs as function parameter so LangSmith captures them
             @traceable(
                 name=run_name or "mistral_generate",
                 run_type="llm",
@@ -286,12 +267,7 @@ class MistralLLMClient(LLMClient):
                 tags=langsmith_tags,
             )
             def _generate_with_trace(inputs: dict):
-                """Generate with explicit inputs for LangSmith tracing.
-                
-                The inputs dict is passed as a parameter so LangSmith can capture
-                the full prompt and messages in the trace.
-                """
-                # Call the actual generation (use original variables, not inputs dict)
+                """Generate with explicit inputs for LangSmith tracing."""
                 result = self._do_generate(
                     messages,
                     temperature,
@@ -300,10 +276,8 @@ class MistralLLMClient(LLMClient):
                 )
                 return result
             
-            # Call with inputs so LangSmith captures them in the trace
             result = _generate_with_trace(langsmith_inputs)
         else:
-            # No tracing, just call directly
             result = self._do_generate(messages, temperature, max_new_tokens, stop)
         
         return result
@@ -344,7 +318,6 @@ class MockLLMClient(LLMClient):
         response = self._responses[self._call_count % len(self._responses)]
         self._call_count += 1
         
-        # Simulate token usage
         usage = TokenUsage(
             prompt_tokens=len(prompt.split()),
             completion_tokens=len(response.split()),
@@ -367,10 +340,6 @@ class MockLLMClient(LLMClient):
     def reset_usage_stats(self) -> None:
         self._usage_tracker.reset()
 
-
-# =============================================================================
-# Factory Function
-# =============================================================================
 
 def create_llm_client(
     api_key: Optional[str] = None,
