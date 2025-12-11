@@ -39,6 +39,8 @@ def build_subanswer_prompt(sub_question: str, context: List[str]) -> str:
     prompt_parts = [
         "Answer the question using ONLY the provided context.",
         "Give a VERY SHORT answer (a few words) using the exact wording from the context. Do not explain.",
+        "CRITICAL: You must provide an answer. Never say 'I don't know', 'idk', 'answer not provided', 'no information', or similar phrases.",
+        "If the answer is not explicitly in the context, make your best guess based on the context provided.",
         "",
         "Context:",
     ]
@@ -60,6 +62,8 @@ def build_final_answer_prompt(question: str, sub_qa_history: List[Tuple[str, str
     prompt_parts = [
         "Answer the main question using ONLY the facts below.",
         "Give a SHORT answer (a few words). Do not explain.",
+        "CRITICAL: You must provide an answer. Never say 'I don't know', 'idk', 'answer not provided', 'no information', 'there is no information', or similar phrases.",
+        "If the answer is not explicitly in the facts, make your best guess based on the facts provided.",
         "",
         f"Main Question: {question}",
         "",

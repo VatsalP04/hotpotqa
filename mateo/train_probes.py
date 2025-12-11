@@ -1,72 +1,44 @@
-"""
-train_probes.py
-
-Script to train lightweight probes on Llama-3.1-8B activations for the
-HotpotQA decomposition dataset.
-
-Usage:
-    python -m mateo.train_probes [mode] [--balance]
-
-Arguments
----------
-mode : {"full", "test"}, optional
-    - "full" (default): full run with ~3000 examples and 8 layers.
-    - "test": tiny smoke test (e.g. 32 examples, 1 layer) to ensure
-      everything runs without errors.
-
---balance : flag, optional
-    Deprecated: class balancing is now always applied to the training set.
-    This flag is kept for backwards compatibility but has no effect.
-
-Expected runtime on an A100 80GB (rough ballpark):
-    - full: ~1–3 minutes with defaults (3k examples, 8 layers, 3 epochs).
-    - test: <10 seconds (32 examples, 1 layer, 1 epoch).
-"""
-
 from __future__ import annotations
 
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from transformer_lens import HookedTransformer
-from collections import defaultdict
 
 from mateo.probes import (
+    ArrayLike,
     ProbeConfig,
     DenseLinearProbe,
     MassMeanProbe,
+    MLPProbe,
+    StreamingAttentionProbe,
 )
 
 
-# Default path; adjust if needed.
+# -------------------------
+#  Paths & SAE config
+# -------------------------
+
 JSON_DATASET_PATH = os.path.join(
     "mateo", "training_datasets", "decomposition_dataset.json"
 )
 
+SAE_RELEASE = "llama_scope_lxr_8x"  # adjust if needed
+
+
+# -------------------------
+#  Dataset loading & splits
+# -------------------------
+
 
 def load_hotpot_decomp_dataset(
     json_path: str,
-) -> Tuple[Dict[str, List[str]], np.ndarray, np.ndarray]:
-    """Load dataset and build context strings + labels.
-
-    Parameters
-    ----------
-    json_path : str
-        Path to the JSON dataset file.
-
-    Returns
-    -------
-    contexts : dict
-        Keys are "planning", "subanswer", "final". Values are lists of context strings.
-    y_correct : np.ndarray, shape (N,)
-        0/1 labels for answer correctness.
-    y_recall_full : np.ndarray, shape (N,)
-        1 if recall == 1.0, else 0.
-    """
+) -> Tuple[Dict[str, List[str]], np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[List[int]]]:
+    """Load dataset and build context strings + labels."""
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"Dataset not found at: {json_path}")
 
@@ -74,10 +46,14 @@ def load_hotpot_decomp_dataset(
         data = json.load(f)
 
     contexts_planning: List[str] = []
-    contexts_subanswer: List[str] = []
     contexts_final: List[str] = []
     correct_labels: List[int] = []
     recall_full_labels: List[int] = []
+
+    subanswer_texts: List[str] = []
+    subanswer_correct: List[int] = []
+    subanswer_recall_full: List[int] = []
+    question_to_subanswer_indices: List[List[int]] = []
 
     for qid, entry in data.items():
         correct = int(entry.get("correct", 0))
@@ -88,39 +64,49 @@ def load_hotpot_decomp_dataset(
         subanswer_list = entry.get("subanswer", [])
         final = entry.get("final", "").strip()
 
-        # Trim <|eot_id|> if it exists at the end
+        # Trim trailing <|eot_id|> if present
         if planning.endswith("<|eot_id|>"):
             planning = planning[:-10].rstrip()
         if final.endswith("<|eot_id|>"):
             final = final[:-10].rstrip()
 
-        # For planning and final, use the text directly
         contexts_planning.append(planning)
         contexts_final.append(final)
 
-        # For subanswer, concatenate all subanswers and trim <|eot_id|>
-        subanswer_parts = []
+        # Subanswers
+        subanswer_indices_for_question: List[int] = []
         for sa in subanswer_list:
             sa_text = str(sa).strip()
             if sa_text.endswith("<|eot_id|>"):
                 sa_text = sa_text[:-10].rstrip()
             if sa_text:
-                subanswer_parts.append(sa_text)
-        subanswer_text = "\n\n".join(subanswer_parts)
-        contexts_subanswer.append(subanswer_text)
+                subanswer_indices_for_question.append(len(subanswer_texts))
+                subanswer_texts.append(sa_text)
+                subanswer_correct.append(correct)
+                subanswer_recall_full.append(recall_full)
+        question_to_subanswer_indices.append(subanswer_indices_for_question)
 
         correct_labels.append(correct)
         recall_full_labels.append(recall_full)
 
     contexts = {
         "planning": contexts_planning,
-        "subanswer": contexts_subanswer,
+        "subanswer": subanswer_texts,
         "final": contexts_final,
     }
     y_correct = np.array(correct_labels, dtype=np.float32)
     y_recall_full = np.array(recall_full_labels, dtype=np.float32)
+    y_subanswer_correct = np.array(subanswer_correct, dtype=np.float32)
+    y_subanswer_recall_full = np.array(subanswer_recall_full, dtype=np.float32)
 
-    return contexts, y_correct, y_recall_full
+    return (
+        contexts,
+        y_correct,
+        y_recall_full,
+        y_subanswer_correct,
+        y_subanswer_recall_full,
+        question_to_subanswer_indices,
+    )
 
 
 def make_splits(
@@ -141,105 +127,127 @@ def make_splits(
     return train_idx, val_idx, test_idx
 
 
-def compute_activations(
-    model: "HookedTransformer",
+# -------------------------
+#  Tokenization & activations
+# -------------------------
+
+
+def tokenize_contexts(
+    model: HookedTransformer,
     contexts: List[str],
-    layers_to_probe: List[int],
-    full_run: bool,
-) -> Dict[int, np.ndarray]:
-    """Compute hidden activations.
-
-    Parameters
-    ----------
-    model :
-        HookedTransformer instance (Llama-3.1-8B).
-    contexts :
-        List of input strings.
-    layers_to_probe :
-        List of layer indices for which to extract resid_post at the final token.
-    full_run :
-        If False (test mode), we may use slightly larger batch size.
-
-    Returns
-    -------
-    hidden_per_layer : dict
-        layer -> np.ndarray of shape (N, d_model).
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Tokenize each context individually to know exact lengths (no padding).
-    print(f"Tokenizing {len(contexts)} examples...")
+) -> Tuple[List[torch.Tensor], List[int]]:
+    """Tokenize each context separately (no truncation)."""
     tokens_list: List[torch.Tensor] = []
     lengths: List[int] = []
     for text in contexts:
         toks = model.to_tokens(text, prepend_bos=True)  # (1, T)
         toks = toks[0]  # (T,)
         tokens_list.append(toks)
-        lengths.append(toks.shape[0])
+        lengths.append(int(toks.shape[0]))
+    return tokens_list, lengths
 
-    n_examples = len(contexts)
+
+def compute_token_activations(
+    model: HookedTransformer,
+    tokens_list: List[torch.Tensor],
+    lengths: List[int],
+    layers_to_probe: List[int],
+    hook_type: str,
+    full_run: bool,
+    token_pooling: str = "single",
+    pool_k: int = 4,
+    token_offset: int = 0,
+) -> Dict[int, np.ndarray]:
+    """Compute pooled residual activations for chosen layers.
+
+    token_pooling:
+        - "single": use a single token from the end, offset by token_offset.
+            token_offset = 0 -> last token
+            token_offset = 1 -> second-to-last, etc.
+        - "mean_last_k": mean over the last pool_k tokens.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    n_examples = len(tokens_list)
     d_model = model.cfg.d_model
 
-    # Preallocate storage on CPU.
     hidden_per_layer: Dict[int, np.ndarray] = {
         layer: np.empty((n_examples, d_model), dtype=np.float32)
         for layer in layers_to_probe
     }
 
-    # Hook names
-    hook_names = [f"blocks.{layer}.hook_resid_post" for layer in layers_to_probe]
+    hook_names = [f"blocks.{layer}.hook_{hook_type}" for layer in layers_to_probe]
 
     def names_filter(name: str) -> bool:
         return name in hook_names
 
-    # Conservative batch size to avoid OOM.
     batch_size = 4 if full_run else 8
     print(
-        f"Computing activations for {n_examples} examples "
-        f"(batch_size={batch_size}, layers={layers_to_probe})..."
+        f"Computing token activations (pooling={token_pooling}, pool_k={pool_k}, "
+        f"token_offset={token_offset}) for {n_examples} examples "
+        f"(batch_size={batch_size}, layers={layers_to_probe}, hook_type={hook_type})..."
     )
 
     model.to(device)
     model.eval()
 
+    lengths_tensor = torch.tensor(lengths, device=device)
     start = 0
     with torch.no_grad():
         while start < n_examples:
             end = min(start + batch_size, n_examples)
             batch_tokens = tokens_list[start:end]
-            batch_lengths = torch.tensor(lengths[start:end], device=device)
+            batch_lengths = lengths_tensor[start:end]
             bsz = len(batch_tokens)
             max_len = int(batch_lengths.max().item())
 
-            # Right-pad with arbitrary token id (0); causal mask ensures
-            # pads do not influence earlier tokens.
             input_ids = torch.zeros((bsz, max_len), dtype=torch.long, device=device)
             for i, toks in enumerate(batch_tokens):
                 L = toks.shape[0]
                 input_ids[i, :L] = toks.to(device)
 
-            # Forward with cache
             logits, cache = model.run_with_cache(
                 input_ids,
                 return_type="logits",
                 names_filter=names_filter,
             )
 
-            positions = batch_lengths - 1  # final token index per example
             batch_indices = torch.arange(bsz, device=device)
 
-            # Hidden states per layer (final token)
             for layer in layers_to_probe:
-                hook_name = f"blocks.{layer}.hook_resid_post"
+                hook_name = f"blocks.{layer}.hook_{hook_type}"
                 acts = cache[hook_name]  # (bsz, max_len, d_model)
-                final_acts = acts[batch_indices, positions, :]  # (bsz, d_model)
-                hidden_per_layer[layer][start:end, :] = (
-                    final_acts.float().cpu().numpy()
-                )
+
+                if token_pooling == "single":
+                    # Choose a single token from the end with offset
+                    # pos = L_i - 1 - token_offset, but clipped to [0, L_i-1]
+                    positions = []
+                    for i in range(bsz):
+                        L_i = int(batch_lengths[i].item())
+                        pos_i = max(0, L_i - 1 - token_offset)
+                        positions.append(pos_i)
+                    positions_t = torch.tensor(positions, device=device, dtype=torch.long)
+                    pooled = acts[batch_indices, positions_t, :]  # (bsz, d_model)
+
+                elif token_pooling == "mean_last_k":
+                    pooled_list = []
+                    for i in range(bsz):
+                        L_i = int(batch_lengths[i].item())
+                        k_i = min(L_i, pool_k)
+                        start_i = L_i - k_i
+                        pooled_i = acts[i, start_i:L_i, :].mean(dim=0)
+                        pooled_list.append(pooled_i)
+                    pooled = torch.stack(pooled_list, dim=0)  # (bsz, d_model)
+
+                else:
+                    raise ValueError(
+                        f"Unknown token_pooling mode: {token_pooling!r}. "
+                        "Expected one of {'single', 'mean_last_k'}."
+                    )
+
+                hidden_per_layer[layer][start:end, :] = pooled.float().cpu().numpy()
 
             start = end
-
-            # Free batch cache/logits
             del logits, cache
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -247,104 +255,128 @@ def compute_activations(
     return hidden_per_layer
 
 
+# -------------------------
+#  Metrics & balancing
+# -------------------------
+
+
 def has_both_classes(y: np.ndarray) -> bool:
-    """Return True if y contains both 0 and 1."""
     uniq = np.unique(y)
     return len(uniq) >= 2 and (0.0 in uniq) and (1.0 in uniq)
 
 
-def calculate_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[float, float, float, float]:
-    """Calculate accuracy, precision, recall, and F1 for binary classification.
-    
-    Parameters
-    ----------
-    y_true : np.ndarray
-        True binary labels (0 or 1).
-    y_pred : np.ndarray
-        Predicted binary labels (0 or 1).
-    
-    Returns
-    -------
-    accuracy : float
-        Accuracy score.
-    precision : float
-        Precision score (TP / (TP + FP)).
-    recall : float
-        Recall score (TP / (TP + FN)).
-    f1 : float
-        F1 score (2 * precision * recall / (precision + recall)).
-    """
+def calculate_metrics(
+    y_true: np.ndarray, y_pred: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """Accuracy, precision, recall, F1 for class 0."""
+    y_true = y_true.astype(np.float32)
+    y_pred = y_pred.astype(np.float32)
+
     accuracy = float((y_pred == y_true).mean())
-    
-    # Calculate TP, FP, FN, TN
-    tp = float(((y_pred == 1) & (y_true == 1)).sum())
-    fp = float(((y_pred == 1) & (y_true == 0)).sum())
-    fn = float(((y_pred == 0) & (y_true == 1)).sum())
-    
-    # Precision: TP / (TP + FP)
+    tp = float(((y_pred == 0.0) & (y_true == 0.0)).sum())
+    fp = float(((y_pred == 0.0) & (y_true == 1.0)).sum())
+    fn = float(((y_pred == 1.0) & (y_true == 0.0)).sum())
+
     precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    
-    # Recall: TP / (TP + FN)
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-    
-    # F1: 2 * precision * recall / (precision + recall)
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
-    
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
     return accuracy, precision, recall, f1
 
 
 def downsample_balanced(
     indices: np.ndarray, labels: np.ndarray, rng: np.random.Generator
 ) -> np.ndarray:
-    """Downsample indices to balance class distribution.
-    
-    Parameters
-    ----------
-    indices : np.ndarray
-        Array of indices to downsample from.
-    labels : np.ndarray
-        Binary labels (0 or 1) corresponding to indices.
-    rng : np.random.Generator
-        Random number generator for reproducibility.
-    
-    Returns
-    -------
-    balanced_indices : np.ndarray
-        Downsampled indices with balanced class distribution.
-    """
+    """Downsample indices to balance class distribution."""
     if len(indices) == 0:
         return indices
 
-    # Get labels for the given indices
     idx_labels = labels[indices]
 
-    # Find indices for each class
-    class_0_mask = idx_labels == 0.0
-    class_1_mask = idx_labels == 1.0
+    class_0_indices = indices[idx_labels == 0.0]
+    class_1_indices = indices[idx_labels == 1.0]
 
-    class_0_indices = indices[class_0_mask]
-    class_1_indices = indices[class_1_mask]
+    n0 = len(class_0_indices)
+    n1 = len(class_1_indices)
 
-    n_class_0 = len(class_0_indices)
-    n_class_1 = len(class_1_indices)
-
-    # If both classes exist, downsample to the smaller class size
-    if n_class_0 > 0 and n_class_1 > 0:
-        min_size = min(n_class_0, n_class_1)
-        if n_class_0 > min_size:
-            class_0_indices = rng.choice(class_0_indices, size=min_size, replace=False)
-        if n_class_1 > min_size:
-            class_1_indices = rng.choice(class_1_indices, size=min_size, replace=False)
-        balanced_indices = np.concatenate([class_0_indices, class_1_indices])
-        rng.shuffle(balanced_indices)
-        return balanced_indices
-    else:
-        # Only one class exists, return as-is
+    if n0 == 0 or n1 == 0:
         return indices
 
+    k = min(n0, n1)
+    if n0 > k:
+        class_0_indices = rng.choice(class_0_indices, size=k, replace=False)
+    if n1 > k:
+        class_1_indices = rng.choice(class_1_indices, size=k, replace=False)
 
-def train_all_probes(
-    hidden_per_layer: Dict[int, np.ndarray],
+    balanced = np.concatenate([class_0_indices, class_1_indices])
+    rng.shuffle(balanced)
+    return balanced
+
+
+# -------------------------
+#  SAE latents (optional)
+# -------------------------
+
+
+def compute_sae_latents_per_layer(
+    final_acts_per_layer: Dict[int, np.ndarray],
+    layers_for_sae: List[int],
+    device: torch.device,
+) -> Dict[int, np.ndarray]:
+    """Compute SAE latents for pooled activations (via sae_lens)."""
+    try:
+        from sae_lens import SAE  # type: ignore[import]
+    except ImportError as e:
+        raise ImportError(
+            "sae_lens is required for --use_sae_probes. Install via `pip install sae-lens`."
+        ) from e
+
+    sae_latents_per_layer: Dict[int, np.ndarray] = {}
+
+    for layer in layers_for_sae:
+        X = final_acts_per_layer[layer]  # (N, d_model)
+        N, _ = X.shape
+        print(
+            f"Loading SAE for layer {layer} "
+            f"(release={SAE_RELEASE}, sae_id=l{layer}r_8x)..."
+        )
+
+        res = SAE.from_pretrained(
+            release=SAE_RELEASE,
+            sae_id=f"l{layer}r_8x",
+            device=str(device),
+        )
+        sae = res[0] if isinstance(res, tuple) else res
+        sae.eval()
+
+        with torch.no_grad():
+            x_t = torch.tensor(X, dtype=torch.float32, device=device)  # (N, D)
+            x_t = x_t.unsqueeze(1)  # (N, 1, D)
+            latents = sae.encode(x_t)  # (N, 1, K)
+            if latents.ndim == 3:
+                latents = latents[:, 0, :]
+            else:
+                latents = latents.view(N, -1)
+            sae_latents_per_layer[layer] = latents.float().cpu().numpy()
+
+        del sae, latents, x_t
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    return sae_latents_per_layer
+
+
+# -------------------------
+#  Training: dense / mass / mlp on pooled resid
+# -------------------------
+
+
+def train_dense_mass_mlp_for_context(
+    context_type: str,
+    final_acts_per_layer: Dict[int, np.ndarray],
     y_correct: np.ndarray,
     y_recall_full: np.ndarray,
     train_idx: np.ndarray,
@@ -352,466 +384,780 @@ def train_all_probes(
     test_idx: np.ndarray,
     layers_to_probe: List[int],
     full_run: bool,
-    balance: bool = False,
-    rng: Optional[np.random.Generator] = None,
-    context_type: str = "planning",
+    balance: bool,
+    rng: np.random.Generator,
+    hook_type: str,
+    probs_dict: Dict[str, np.ndarray],
+    meta_dict: Dict[str, Dict[str, Any]],
+    completed_keys: set,
+    additional_data: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Train DenseLinear and MassMean probes on all tasks.
-    
-    Parameters
-    ----------
-    balance : bool, default=False
-        Deprecated: class balancing is now always applied to the training set.
-        This parameter is kept for backwards compatibility but has no effect.
-    rng : np.random.Generator, optional
-        Random number generator for downsampling. Required for class balancing.
-    context_type : str, default="planning"
-        Type of context: "planning", "subanswer", or "final".
-    
-    Note
-    ----
-    Class balancing is always applied to the training set (not val/test):
-    - For "correct" and "correct_given_recall1" tasks: balances based on y_correct.
-    - For "recall_full" task: balances based on y_recall_full.
-    - The "correct_given_recall1" task only filters to recall=1.0 for the TRAINING set.
-    """
-    os.makedirs("trained_probes", exist_ok=True)
-
-    if rng is None:
-        raise ValueError("rng must be provided for class balancing")
-
-    n = y_correct.shape[0]
-    train_mask = np.zeros(n, dtype=bool)
-    val_mask = np.zeros(n, dtype=bool)
-    test_mask = np.zeros(n, dtype=bool)
-    train_mask[train_idx] = True
-    val_mask[val_idx] = True
-    test_mask[test_idx] = True
-
-    recall1_mask = y_recall_full == 1.0
+    """Train DenseLinear, MassMean, and MLP probes on pooled residuals."""
+    print(f"\n=== {context_type.upper()} :: Dense / MassMean / MLP probes ===")
 
     tasks = [
         ("correct", y_correct, None),
-        ("correct_given_recall1", y_correct, recall1_mask),
+        ("correct_given_recall1", y_correct, (y_recall_full == 1.0)),
         ("recall_full", y_recall_full, None),
     ]
 
-    num_epochs_dense = 3 if full_run else 1
-    num_epochs_mass = 50 if full_run else 10
+    num_epochs_dense = 10 if full_run else 3
+    num_epochs_mass = 100 if full_run else 20
+    num_epochs_mlp = 10 if full_run else 3
 
-    results: List[Dict[str, object]] = []
-
-    # ---- DenseLinearProbe per layer ----
-    print("\n=== Training DenseLinearProbes ===")
-    for task_name, y_all, extra_mask in tasks:
+    for task_name, y_all, train_restrict in tasks:
         for layer in layers_to_probe:
-            X = hidden_per_layer[layer]
+            X = final_acts_per_layer[layer]  # (N, d_model)
 
-            # For correct_given_recall1, only filter training set to recall=1
-            # Val and test sets use all examples
-            if task_name == "correct_given_recall1" and extra_mask is not None:
-                train_m = extra_mask & train_mask
-                val_m = val_mask  # Use all val examples
-                test_m = test_mask  # Use all test examples
+            if task_name == "correct_given_recall1" and train_restrict is not None:
+                mask_train = train_restrict
+                train_ids_task = train_idx[mask_train[train_idx]]
+                val_ids_task = val_idx
+                test_ids_task = test_idx
             else:
-                base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
-                train_m = base_mask & train_mask
-                val_m = base_mask & val_mask
-                test_m = base_mask & test_mask
+                train_ids_task = train_idx
+                val_ids_task = val_idx
+                test_ids_task = test_idx
 
-            if train_m.sum() < 2:
+            if len(train_ids_task) < 2:
                 print(
-                    f"[Dense] Skipping layer {layer}, task {task_name}: "
-                    f"not enough training examples ({train_m.sum()})."
+                    f"[{context_type}|{task_name}] Skipping layer {layer}: "
+                    f"not enough train examples ({len(train_ids_task)})."
                 )
                 continue
 
-            # Always apply class balancing to training set (not val/test)
-            if rng is not None:
-                train_indices = np.where(train_m)[0]
-                # For "correct" tasks, balance based on y_correct
-                # For "recall_full" task, balance based on y_recall_full
+            if balance:
                 if task_name in ("correct", "correct_given_recall1"):
-                    balanced_train_indices = downsample_balanced(
-                        train_indices, y_correct, rng
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_correct, rng
                     )
                 elif task_name == "recall_full":
-                    balanced_train_indices = downsample_balanced(
-                        train_indices, y_recall_full, rng
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_recall_full, rng
                     )
-                else:
-                    balanced_train_indices = train_indices
-
-                # Update train_m to only include balanced indices
-                train_m_balanced = np.zeros(n, dtype=bool)
-                train_m_balanced[balanced_train_indices] = True
-                train_m = train_m_balanced
-
-                if train_m.sum() < 2:
+                if len(train_ids_task) < 2:
                     print(
-                        f"[Dense] Skipping layer {layer}, task {task_name}: "
-                        f"not enough training examples after balancing ({train_m.sum()})."
+                        f"[{context_type}|{task_name}] Skipping layer {layer}: "
+                        f"not enough train examples after balancing ({len(train_ids_task)})."
                     )
                     continue
 
-            X_train, y_train = X[train_m], y_all[train_m]
-            X_val, y_val = (X[val_m], y_all[val_m]) if val_m.sum() > 0 else (None, None)
+            X_train, y_train = X[train_ids_task], y_all[train_ids_task]
+            X_val, y_val = X[val_ids_task], y_all[val_ids_task]
+            X_test, y_test = X[test_ids_task], y_all[test_ids_task]
 
-            cfg = ProbeConfig(
-                probe_type="dense_linear",
-                layer=layer,
-                task_name=task_name,
-                use_l1=False,
-                l1_lambda=0.0,
-            )
-            probe = DenseLinearProbe(cfg)
-            metrics = probe.fit(
-                X_train,
-                y_train,
-                val_x=X_val,
-                val_y=y_val,
-                num_epochs=num_epochs_dense,
-                lr=1e-3,
-                weight_decay=0.0,
-                batch_size=256,
-                device=None,
-                verbose=False,
-            )
-
-            test_acc = float("nan")
-            test_precision = float("nan")
-            test_recall = float("nan")
-            test_f1 = float("nan")
-            if test_m.sum() > 0:
-                X_test, y_test = X[test_m], y_all[test_m]
-                probs = probe.predict_proba(X_test)
-                preds = (probs >= 0.5).astype(np.float32)
-                test_acc, test_precision, test_recall, test_f1 = calculate_metrics(y_test, preds)
-
-            print(
-                f"[Dense] Task={task_name:>20} | layer={layer:2d} | "
-                f"train_loss={metrics.get('train_loss', float('nan')):.4f} | "
-                f"test_acc={test_acc:.3f} | test_prec={test_precision:.3f} | "
-                f"test_rec={test_recall:.3f} | test_f1={test_f1:.3f}"
-            )
-
-            probe_path = os.path.join(
-                "trained_probes", f"dense_layer{layer}_{context_type}_{task_name}.pt"
-            )
-            probe.save(probe_path)
-
-            results.append(
-                {
-                    "probe_type": "dense_linear",
-                    "context_type": context_type,
-                    "task": task_name,
-                    "layer": layer,
-                    "train_loss": float(metrics.get("train_loss", float("nan"))),
-                    "val_loss": float(metrics.get("val_loss", float("nan"))),
-                    "test_acc": test_acc,
-                    "test_precision": test_precision,
-                    "test_recall": test_recall,
-                    "test_f1": test_f1,
-                }
-            )
-
-    # ---- MassMeanProbe per layer ----
-    print("\n=== Training MassMeanProbes ===")
-    for task_name, y_all, extra_mask in tasks:
-        for layer in layers_to_probe:
-            X = hidden_per_layer[layer]
-
-            # For correct_given_recall1, only filter training set to recall=1
-            # Val and test sets use all examples
-            if task_name == "correct_given_recall1" and extra_mask is not None:
-                train_m = extra_mask & train_mask
-                val_m = val_mask  # Use all val examples
-                test_m = test_mask  # Use all test examples
+            # ----- DenseLinear -----
+            key = f"{context_type}__{task_name}__dense__L{layer}__{hook_type}__resid"
+            if key in completed_keys:
+                print(f"[Dense] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | SKIPPED (already completed)")
             else:
-                base_mask = extra_mask if extra_mask is not None else np.ones(n, dtype=bool)
-                train_m = base_mask & train_mask
-                val_m = base_mask & val_mask
-                test_m = base_mask & test_mask
-
-            # Always apply class balancing to training set (not val/test)
-            if rng is not None:
-                train_indices = np.where(train_m)[0]
-                if task_name in ("correct", "correct_given_recall1"):
-                    balanced_train_indices = downsample_balanced(
-                        train_indices, y_correct, rng
-                    )
-                elif task_name == "recall_full":
-                    balanced_train_indices = downsample_balanced(
-                        train_indices, y_recall_full, rng
-                    )
-                else:
-                    balanced_train_indices = train_indices
-
-                train_m_balanced = np.zeros(n, dtype=bool)
-                train_m_balanced[balanced_train_indices] = True
-                train_m = train_m_balanced
-
-            X_train, y_train = X[train_m], y_all[train_m]
-            X_val, y_val = (X[val_m], y_all[val_m]) if val_m.sum() > 0 else (None, None)
-
-            if X_train.shape[0] < 2 or not has_both_classes(y_train):
-                print(
-                    f"[MassMean] Skipping layer {layer}, task {task_name}: "
-                    f"not enough data or only one class."
+                cfg_dense = ProbeConfig(
+                    probe_type="dense_linear",
+                    layer=layer,
+                    task_name=task_name,
+                    context_type=context_type,
+                    hook_point=hook_type,
+                    feature_space="resid",
                 )
-                continue
-
-            cfg = ProbeConfig(
-                probe_type="mass_mean",
-                layer=layer,
-                task_name=task_name,
-            )
-            probe = MassMeanProbe(cfg)
-            try:
-                metrics = probe.fit(
+                dense_probe = DenseLinearProbe(cfg_dense)
+                dense_probe.fit(
                     X_train,
                     y_train,
                     val_x=X_val,
                     val_y=y_val,
-                    num_epochs=num_epochs_mass,
-                    lr=5e-2,
+                    num_epochs=num_epochs_dense,
+                    lr=1e-3,
+                    batch_size=256,
                     device=None,
                     verbose=False,
                 )
-            except ValueError as e:
+
+                probs_all = dense_probe.predict_proba(X)
+                metadata = {
+                    "context_type": context_type,
+                    "task_name": task_name,
+                    "probe_type": "dense",
+                    "layer": layer,
+                    "hook_type": hook_type,
+                    "feature_space": "resid",
+                }
+                # Save probe as individual file
+                probe_file = os.path.join("trained_probes2", f"{key}.pt")
+                dense_probe.save(probe_file)
+                save_probe_result(
+                    key, probs_all.astype(np.float32), metadata,
+                    probs_dict, meta_dict, completed_keys, additional_data
+                )
+
+                val_probs = probs_all[val_ids_task]
+                val_preds = (val_probs >= 0.5).astype(np.float32)
+                val_acc, val_prec, val_rec, val_f1 = calculate_metrics(y_val, val_preds)
                 print(
-                    f"[MassMean] Error for layer {layer}, task {task_name}: {e}. "
-                    "Skipping."
+                    f"[Dense] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | "
+                    f"val_acc={val_acc:.3f} | prec={val_prec:.3f} | rec={val_rec:.3f} | f1={val_f1:.3f}"
+                )
+
+            # ----- MassMean -----
+            if has_both_classes(y_train):
+                key_mm = (
+                    f"{context_type}__{task_name}__mass_mean__"
+                    f"L{layer}__{hook_type}__resid"
+                )
+                if key_mm in completed_keys:
+                    print(f"[MassMean] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | SKIPPED (already completed)")
+                else:
+                    cfg_mm = ProbeConfig(
+                        probe_type="mass_mean",
+                        layer=layer,
+                        task_name=task_name,
+                        context_type=context_type,
+                        hook_point=hook_type,
+                        feature_space="resid",
+                    )
+                    mm_probe = MassMeanProbe(cfg_mm)
+                    try:
+                        mm_probe.fit(
+                            X_train,
+                            y_train,
+                            val_x=X_val,
+                            val_y=y_val,
+                            num_epochs=num_epochs_mass,
+                            lr=5e-2,
+                            device=None,
+                            verbose=False,
+                        )
+                    except ValueError as e:
+                        print(
+                            f"[MassMean] {context_type}|{task_name}|L{layer}: error {e}; skipping."
+                        )
+                    else:
+                        probs_all_mm = mm_probe.predict_proba(X)
+                        metadata_mm = {
+                            "context_type": context_type,
+                            "task_name": task_name,
+                            "probe_type": "mass_mean",
+                            "layer": layer,
+                            "hook_type": hook_type,
+                            "feature_space": "resid",
+                        }
+                        # Save probe as individual file
+                        probe_file = os.path.join("trained_probes2", f"{key_mm}.pt")
+                        mm_probe.save(probe_file)
+                        save_probe_result(
+                            key_mm, probs_all_mm.astype(np.float32), metadata_mm,
+                            probs_dict, meta_dict, completed_keys, additional_data
+                        )
+
+                        val_probs_mm = probs_all_mm[val_ids_task]
+                        val_preds_mm = (val_probs_mm >= 0.5).astype(np.float32)
+                        val_acc_mm, val_prec_mm, val_rec_mm, val_f1_mm = calculate_metrics(
+                            y_val, val_preds_mm
+                        )
+                        print(
+                            f"[MassMean] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | "
+                            f"val_acc={val_acc_mm:.3f} | prec={val_prec_mm:.3f} | "
+                            f"rec={val_rec_mm:.3f} | f1={val_f1_mm:.3f}"
+                        )
+
+            # ----- MLP -----
+            key_mlp = f"{context_type}__{task_name}__mlp__L{layer}__{hook_type}__resid"
+            if key_mlp in completed_keys:
+                print(f"[MLP]   {context_type:>9} | task={task_name:>20} | layer={layer:2d} | SKIPPED (already completed)")
+            else:
+                cfg_mlp = ProbeConfig(
+                    probe_type="mlp",
+                    layer=layer,
+                    task_name=task_name,
+                    context_type=context_type,
+                    hook_point=hook_type,
+                    feature_space="resid",
+                    hidden_dim=512,
+                )
+                mlp_probe = MLPProbe(cfg_mlp)
+                mlp_probe.fit(
+                    X_train,
+                    y_train,
+                    val_x=X_val,
+                    val_y=y_val,
+                    num_epochs=num_epochs_mlp,
+                    lr=1e-3,
+                    batch_size=256,
+                    device=None,
+                    verbose=False,
+                )
+
+                probs_all_mlp = mlp_probe.predict_proba(X)
+                metadata_mlp = {
+                    "context_type": context_type,
+                    "task_name": task_name,
+                    "probe_type": "mlp",
+                    "layer": layer,
+                    "hook_type": hook_type,
+                    "feature_space": "resid",
+                }
+                # Save probe as individual file
+                probe_file = os.path.join("trained_probes2", f"{key_mlp}.pt")
+                mlp_probe.save(probe_file)
+                save_probe_result(
+                    key_mlp, probs_all_mlp.astype(np.float32), metadata_mlp,
+                    probs_dict, meta_dict, completed_keys, additional_data
+                )
+
+                val_probs_mlp = probs_all_mlp[val_ids_task]
+                val_preds_mlp = (val_probs_mlp >= 0.5).astype(np.float32)
+                val_acc_mlp, val_prec_mlp, val_rec_mlp, val_f1_mlp = calculate_metrics(
+                    y_val, val_preds_mlp
+                )
+                print(
+                    f"[MLP]   {context_type:>9} | task={task_name:>20} | layer={layer:2d} | "
+                    f"val_acc={val_acc_mlp:.3f} | prec={val_prec_mlp:.3f} | "
+                    f"rec={val_rec_mlp:.3f} | f1={val_f1_mlp:.3f}"
+                )
+
+
+# -------------------------
+#  Training: SAE dense probes
+# -------------------------
+
+
+def train_sae_dense_for_context(
+    context_type: str,
+    sae_latents_per_layer: Dict[int, np.ndarray],
+    y_correct: np.ndarray,
+    y_recall_full: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    layers_for_sae: List[int],
+    full_run: bool,
+    balance: bool,
+    rng: np.random.Generator,
+    hook_type: str,
+    probs_dict: Dict[str, np.ndarray],
+    meta_dict: Dict[str, Dict[str, Any]],
+    completed_keys: set,
+    additional_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Train DenseLinear probes on SAE latents."""
+    print(f"\n=== {context_type.upper()} :: SAE Dense probes ===")
+
+    tasks = [
+        ("correct", y_correct, None),
+        ("correct_given_recall1", y_correct, (y_recall_full == 1.0)),
+        ("recall_full", y_recall_full, None),
+    ]
+
+    num_epochs_dense = 10 if full_run else 3
+
+    for task_name, y_all, train_restrict in tasks:
+        for layer in layers_for_sae:
+            X = sae_latents_per_layer[layer]
+
+            if task_name == "correct_given_recall1" and train_restrict is not None:
+                mask_train = train_restrict
+                train_ids_task = train_idx[mask_train[train_idx]]
+                val_ids_task = val_idx
+                test_ids_task = test_idx
+            else:
+                train_ids_task = train_idx
+                val_ids_task = val_idx
+                test_ids_task = test_idx
+
+            if len(train_ids_task) < 2:
+                print(
+                    f"[SAE|{context_type}|{task_name}] Skipping layer {layer}: "
+                    f"not enough train examples ({len(train_ids_task)})."
                 )
                 continue
 
-            test_acc = float("nan")
-            test_precision = float("nan")
-            test_recall = float("nan")
-            test_f1 = float("nan")
-            if test_m.sum() > 0:
-                X_test, y_test = X[test_m], y_all[test_m]
-                probs = probe.predict_proba(X_test)
-                preds = (probs >= 0.5).astype(np.float32)
-                test_acc, test_precision, test_recall, test_f1 = calculate_metrics(y_test, preds)
+            if balance:
+                if task_name in ("correct", "correct_given_recall1"):
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_correct, rng
+                    )
+                elif task_name == "recall_full":
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_recall_full, rng
+                    )
+                if len(train_ids_task) < 2:
+                    print(
+                        f"[SAE|{context_type}|{task_name}] Skipping layer {layer}: "
+                        f"not enough train examples after balancing ({len(train_ids_task)})."
+                    )
+                    continue
 
-            print(
-                f"[MassMean] Task={task_name:>20} | layer={layer:2d} | "
-                f"train_loss={metrics.get('train_loss', float('nan')):.4f} | "
-                f"test_acc={test_acc:.3f} | test_prec={test_precision:.3f} | "
-                f"test_rec={test_recall:.3f} | test_f1={test_f1:.3f}"
-            )
+            X_train, y_train = X[train_ids_task], y_all[train_ids_task]
+            X_val, y_val = X[val_ids_task], y_all[val_ids_task]
+            X_test, y_test = X[test_ids_task], y_all[test_ids_task]
 
-            probe_path = os.path.join(
-                "trained_probes", f"massmean_layer{layer}_{context_type}_{task_name}.pt"
-            )
-            probe.save(probe_path)
+            key = f"{context_type}__{task_name}__dense_sae__L{layer}__{hook_type}__sae"
+            if key in completed_keys:
+                print(f"[SAE-Dense] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | SKIPPED (already completed)")
+            else:
+                cfg = ProbeConfig(
+                    probe_type="dense_linear",
+                    layer=layer,
+                    task_name=task_name,
+                    context_type=context_type,
+                    hook_point=hook_type,
+                    feature_space="sae",
+                )
+                probe = DenseLinearProbe(cfg)
+                probe.fit(
+                    X_train,
+                    y_train,
+                    val_x=X_val,
+                    val_y=y_val,
+                    num_epochs=num_epochs_dense,
+                    lr=1e-3,
+                    batch_size=256,
+                    device=None,
+                    verbose=False,
+                )
 
-            results.append(
-                {
-                    "probe_type": "mass_mean",
+                probs_all = probe.predict_proba(X)
+                metadata = {
                     "context_type": context_type,
-                    "task": task_name,
+                    "task_name": task_name,
+                    "probe_type": "dense_sae",
                     "layer": layer,
-                    "train_loss": float(metrics.get("train_loss", float("nan"))),
-                    "val_loss": float(metrics.get("val_loss", float("nan"))),
-                    "test_acc": test_acc,
-                    "test_precision": test_precision,
-                    "test_recall": test_recall,
-                    "test_f1": test_f1,
+                    "hook_type": hook_type,
+                    "feature_space": "sae",
                 }
+                # Save probe as individual file
+                probe_file = os.path.join("trained_probes2", f"{key}.pt")
+                probe.save(probe_file)
+                save_probe_result(
+                    key, probs_all.astype(np.float32), metadata,
+                    probs_dict, meta_dict, completed_keys, additional_data
+                )
+
+                val_probs = probs_all[val_ids_task]
+                val_preds = (val_probs >= 0.5).astype(np.float32)
+                val_acc, val_prec, val_rec, val_f1 = calculate_metrics(y_val, val_preds)
+                print(
+                    f"[SAE-Dense] {context_type:>9} | task={task_name:>20} | layer={layer:2d} | "
+                    f"val_acc={val_acc:.3f} | prec={val_prec:.3f} | rec={val_rec:.3f} | f1={val_f1:.3f}"
+                )
+
+
+# -------------------------
+#  Streaming attention probes
+# -------------------------
+
+
+def train_attention_for_context_streaming(
+    context_type: str,
+    tokens_list: List[torch.Tensor],
+    lengths: List[int],
+    model: HookedTransformer,
+    y_correct: np.ndarray,
+    y_recall_full: np.ndarray,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    test_idx: np.ndarray,
+    layers_for_attn: List[int],
+    full_run: bool,
+    balance: bool,
+    rng: np.random.Generator,
+    hook_type: str,
+    probs_dict: Dict[str, np.ndarray],
+    meta_dict: Dict[str, Dict[str, Any]],
+    completed_keys: set,
+    additional_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Train attention-style pooling probes by streaming through the model."""
+    print(f"\n=== {context_type.upper()} :: Streaming AttentionPooling probes ===")
+
+    from probes import StreamingAttentionProbe  # avoid circular import at top
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    tasks = [
+        ("correct", y_correct, None),
+        ("correct_given_recall1", y_correct, (y_recall_full == 1.0)),
+        ("recall_full", y_recall_full, None),
+    ]
+
+    num_epochs = 3 if full_run else 1
+    batch_size = 2
+
+    N = len(tokens_list)
+    lengths_np = np.array(lengths, dtype=np.int64)
+
+    for task_name, y_all, train_restrict in tasks:
+        for layer in layers_for_attn:
+            key = (
+                f"{context_type}__{task_name}__attn_pool__"
+                f"L{layer}__{hook_type}__resid"
+            )
+            if key in completed_keys:
+                print(f"[Attn]  {context_type:>9} | task={task_name:>20} | layer={layer:2d} | SKIPPED (already completed)")
+                continue
+
+            hook_name = f"blocks.{layer}.hook_{hook_type}"
+
+            if task_name == "correct_given_recall1" and train_restrict is not None:
+                mask_train = train_restrict
+                train_ids_task = train_idx[mask_train[train_idx]]
+                val_ids_task = val_idx
+                test_ids_task = test_idx
+            else:
+                train_ids_task = train_idx
+                val_ids_task = val_idx
+                test_ids_task = test_idx
+
+            if len(train_ids_task) < 2:
+                print(
+                    f"[Attn|{context_type}|{task_name}] Skipping layer {layer}: "
+                    f"not enough train examples ({len(train_ids_task)})."
+                )
+                continue
+
+            if balance:
+                if task_name in ("correct", "correct_given_recall1"):
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_correct, rng
+                    )
+                elif task_name == "recall_full":
+                    train_ids_task = downsample_balanced(
+                        train_ids_task, y_recall_full, rng
+                    )
+                if len(train_ids_task) < 2:
+                    print(
+                        f"[Attn|{context_type}|{task_name}] Skipping layer {layer}: "
+                        f"not enough train examples after balancing ({len(train_ids_task)})."
+                    )
+                    continue
+
+            d_model = model.cfg.d_model
+            probe = StreamingAttentionProbe(d_model=d_model, hidden_dim=128).to(device)
+            optimizer = torch.optim.AdamW(probe.parameters(), lr=1e-3, weight_decay=0.0)
+            criterion = torch.nn.BCEWithLogitsLoss()
+
+            # Train
+            for epoch in range(num_epochs):
+                rng.shuffle(train_ids_task)
+                total_loss = 0.0
+                n_batches = 0
+
+                for start_idx in range(0, len(train_ids_task), batch_size):
+                    batch_ids = train_ids_task[start_idx : start_idx + batch_size]
+                    B = len(batch_ids)
+                    if B == 0:
+                        continue
+
+                    batch_lens = lengths_np[batch_ids]
+                    max_len = int(batch_lens.max())
+                    input_ids = torch.zeros(
+                        (B, max_len), dtype=torch.long, device=device
+                    )
+                    for j, idx in enumerate(batch_ids):
+                        toks = tokens_list[int(idx)].to(device)
+                        L = toks.shape[0]
+                        input_ids[j, :L] = toks
+
+                    lengths_t = torch.tensor(
+                        batch_lens, dtype=torch.long, device=device
+                    )
+
+                    with torch.no_grad():
+                        logits_model, cache = model.run_with_cache(
+                            input_ids,
+                            return_type="logits",
+                            names_filter=lambda name: name == hook_name,
+                        )
+                        H = cache[hook_name].float()
+                    del logits_model, cache
+
+                    y_batch = torch.tensor(
+                        y_all[batch_ids], dtype=torch.float32, device=device
+                    )
+
+                    probe.train()
+                    optimizer.zero_grad()
+                    logits_probe = probe(H, lengths_t)
+                    loss = criterion(logits_probe, y_batch)
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += float(loss.item())
+                    n_batches += 1
+
+                    del H, logits_probe, y_batch, input_ids, lengths_t
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+                if n_batches > 0:
+                    avg_loss = total_loss / n_batches
+                    print(
+                        f"[Attn] {context_type:>9} | task={task_name:>20} | "
+                        f"layer={layer:2d} | epoch={epoch+1}/{num_epochs} "
+                        f"| train_loss={avg_loss:.4f}"
+                    )
+
+            # Compute probs for all examples
+            probe.eval()
+            probs_all = np.zeros(N, dtype=np.float32)
+            all_ids = np.arange(N, dtype=np.int64)
+
+            with torch.no_grad():
+                for start_idx in range(0, N, batch_size):
+                    batch_ids = all_ids[start_idx : start_idx + batch_size]
+                    B = len(batch_ids)
+                    if B == 0:
+                        continue
+
+                    batch_lens = lengths_np[batch_ids]
+                    max_len = int(batch_lens.max())
+                    input_ids = torch.zeros(
+                        (B, max_len), dtype=torch.long, device=device
+                    )
+                    for j, idx in enumerate(batch_ids):
+                        toks = tokens_list[int(idx)].to(device)
+                        L = toks.shape[0]
+                        input_ids[j, :L] = toks
+
+                    lengths_t = torch.tensor(
+                        batch_lens, dtype=torch.long, device=device
+                    )
+
+                    logits_model, cache = model.run_with_cache(
+                        input_ids,
+                        return_type="logits",
+                        names_filter=lambda name: name == hook_name,
+                    )
+                    H = cache[hook_name].float()
+                    del logits_model, cache
+
+                    logits_probe = probe(H, lengths_t)
+                    probs_batch = torch.sigmoid(logits_probe).cpu().numpy().astype(
+                        np.float32
+                    )
+                    probs_all[batch_ids] = probs_batch
+
+                    del H, logits_probe, input_ids, lengths_t, probs_batch
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+            metadata = {
+                "context_type": context_type,
+                "task_name": task_name,
+                "probe_type": "attn_pool",
+                "layer": layer,
+                "hook_type": hook_type,
+                "feature_space": "resid",
+            }
+            save_probe_result(
+                key, probs_all, metadata,
+                probs_dict, meta_dict, completed_keys, additional_data
             )
 
-    # Save summary CSV
-    csv_path = os.path.join("trained_probes", f"probe_results_summary_{context_type}.csv")
-    with open(csv_path, "w", encoding="utf-8") as f:
-        header = ["probe_type", "context_type", "task", "layer", "train_loss", "val_loss", 
-                  "test_acc", "test_precision", "test_recall", "test_f1"]
-        f.write(",".join(header) + "\n")
-        for row in results:
-            f.write(
-                f"{row['probe_type']},{row['context_type']},{row['task']},{row['layer']},"
-                f"{row['train_loss']},{row['val_loss']},{row['test_acc']},"
-                f"{row['test_precision']},{row['test_recall']},{row['test_f1']}\n"
+            y_val = y_all[val_idx]
+            val_probs = probs_all[val_idx]
+            val_preds = (val_probs >= 0.5).astype(np.float32)
+            val_acc, val_prec, val_rec, val_f1 = calculate_metrics(y_val, val_preds)
+            print(
+                f"[Attn]  {context_type:>9} | task={task_name:>20} | layer={layer:2d} | "
+                f"VAL: acc={val_acc:.3f} | prec={val_prec:.3f} | "
+                f"rec={val_rec:.3f} | f1={val_f1:.3f}"
             )
-    print(f"\nSaved probe summary to {csv_path}")
-    
-    return results
 
 
-def print_best_probes(all_results: List[Dict[str, object]]) -> None:
-    """Print the best probes for each context type and task category.
-    
-    For each context type (planning, subanswer, final):
-    - Find best probe for answer prediction (correct or correct_given_recall1)
-    - Find best probe for recall prediction (recall_full)
-    
-    For each, output best accuracy, precision, recall, and F1.
-    """
-    print("\n" + "="*80)
-    print("BEST PROBES SUMMARY")
-    print("="*80)
-    
-    context_types = ["planning", "subanswer", "final"]
-    answer_tasks = ["correct", "correct_given_recall1"]
-    recall_task = "recall_full"
-    
-    for context_type in context_types:
-        print(f"\n{context_type.upper()}")
-        print("-" * 80)
-        
-        # Filter results for this context type
-        context_results = [r for r in all_results if r["context_type"] == context_type]
-        
-        # Answer prediction: compare correct and correct_given_recall1
-        answer_results = [r for r in context_results if r["task"] in answer_tasks]
-        
-        if answer_results:
-            print("\n  Answer Prediction (best across 'correct' and 'correct_given_recall1'):")
-            
-            # Filter out NaN values
-            valid_results = [r for r in answer_results if not np.isnan(r.get("test_acc", np.nan))]
-            
-            if valid_results:
-                # Best accuracy
-                best_acc = max(valid_results, key=lambda x: x.get("test_acc", float("-inf")))
-                print(f"    Best Accuracy: {best_acc['test_acc']:.4f}")
-                print(f"      Probe: {best_acc['probe_type']}, Task: {best_acc['task']}, "
-                      f"Layer: {best_acc['layer']}")
-                print(f"      Precision: {best_acc['test_precision']:.4f}, "
-                      f"Recall: {best_acc['test_recall']:.4f}, F1: {best_acc['test_f1']:.4f}")
-                
-                # Best precision
-                valid_prec = [r for r in valid_results if not np.isnan(r.get("test_precision", np.nan))]
-                if valid_prec:
-                    best_prec = max(valid_prec, key=lambda x: x.get("test_precision", float("-inf")))
-                    print(f"    Best Precision: {best_prec['test_precision']:.4f}")
-                    print(f"      Probe: {best_prec['probe_type']}, Task: {best_prec['task']}, "
-                          f"Layer: {best_prec['layer']}")
-                    print(f"      Accuracy: {best_prec['test_acc']:.4f}, "
-                          f"Recall: {best_prec['test_recall']:.4f}, F1: {best_prec['test_f1']:.4f}")
-                
-                # Best recall
-                valid_rec = [r for r in valid_results if not np.isnan(r.get("test_recall", np.nan))]
-                if valid_rec:
-                    best_rec = max(valid_rec, key=lambda x: x.get("test_recall", float("-inf")))
-                    print(f"    Best Recall: {best_rec['test_recall']:.4f}")
-                    print(f"      Probe: {best_rec['probe_type']}, Task: {best_rec['task']}, "
-                          f"Layer: {best_rec['layer']}")
-                    print(f"      Accuracy: {best_rec['test_acc']:.4f}, "
-                          f"Precision: {best_rec['test_precision']:.4f}, F1: {best_rec['test_f1']:.4f}")
-                
-                # Best F1
-                valid_f1 = [r for r in valid_results if not np.isnan(r.get("test_f1", np.nan))]
-                if valid_f1:
-                    best_f1 = max(valid_f1, key=lambda x: x.get("test_f1", float("-inf")))
-                    print(f"    Best F1: {best_f1['test_f1']:.4f}")
-                    print(f"      Probe: {best_f1['probe_type']}, Task: {best_f1['task']}, "
-                          f"Layer: {best_f1['layer']}")
-                    print(f"      Accuracy: {best_f1['test_acc']:.4f}, "
-                          f"Precision: {best_f1['test_precision']:.4f}, "
-                          f"Recall: {best_f1['test_recall']:.4f}")
-        
-        # Recall prediction: recall_full
-        recall_results = [r for r in context_results if r["task"] == recall_task]
-        
-        if recall_results:
-            print("\n  Recall Prediction (recall_full):")
-            
-            # Filter out NaN values
-            valid_results = [r for r in recall_results if not np.isnan(r.get("test_acc", np.nan))]
-            
-            if valid_results:
-                # Best accuracy
-                best_acc = max(valid_results, key=lambda x: x.get("test_acc", float("-inf")))
-                print(f"    Best Accuracy: {best_acc['test_acc']:.4f}")
-                print(f"      Probe: {best_acc['probe_type']}, Task: {best_acc['task']}, "
-                      f"Layer: {best_acc['layer']}")
-                print(f"      Precision: {best_acc['test_precision']:.4f}, "
-                      f"Recall: {best_acc['test_recall']:.4f}, F1: {best_acc['test_f1']:.4f}")
-                
-                # Best precision
-                valid_prec = [r for r in valid_results if not np.isnan(r.get("test_precision", np.nan))]
-                if valid_prec:
-                    best_prec = max(valid_prec, key=lambda x: x.get("test_precision", float("-inf")))
-                    print(f"    Best Precision: {best_prec['test_precision']:.4f}")
-                    print(f"      Probe: {best_prec['probe_type']}, Task: {best_prec['task']}, "
-                          f"Layer: {best_prec['layer']}")
-                    print(f"      Accuracy: {best_prec['test_acc']:.4f}, "
-                          f"Recall: {best_prec['test_recall']:.4f}, F1: {best_prec['test_f1']:.4f}")
-                
-                # Best recall
-                valid_rec = [r for r in valid_results if not np.isnan(r.get("test_recall", np.nan))]
-                if valid_rec:
-                    best_rec = max(valid_rec, key=lambda x: x.get("test_recall", float("-inf")))
-                    print(f"    Best Recall: {best_rec['test_recall']:.4f}")
-                    print(f"      Probe: {best_rec['probe_type']}, Task: {best_rec['task']}, "
-                          f"Layer: {best_rec['layer']}")
-                    print(f"      Accuracy: {best_rec['test_acc']:.4f}, "
-                          f"Precision: {best_rec['test_precision']:.4f}, F1: {best_rec['test_f1']:.4f}")
-                
-                # Best F1
-                valid_f1 = [r for r in valid_results if not np.isnan(r.get("test_f1", np.nan))]
-                if valid_f1:
-                    best_f1 = max(valid_f1, key=lambda x: x.get("test_f1", float("-inf")))
-                    print(f"    Best F1: {best_f1['test_f1']:.4f}")
-                    print(f"      Probe: {best_f1['probe_type']}, Task: {best_f1['task']}, "
-                          f"Layer: {best_f1['layer']}")
-                    print(f"      Accuracy: {best_f1['test_acc']:.4f}, "
-                          f"Precision: {best_f1['test_precision']:.4f}, "
-                          f"Recall: {best_f1['test_recall']:.4f}")
-    
-    print("\n" + "="*80)
+# -------------------------
+#  Checkpointing
+# -------------------------
+
+
+def get_checkpoint_path() -> str:
+    return os.path.join("trained_probes2", "checkpoint.pt")
+
+
+def load_checkpoint() -> Tuple[Dict[str, np.ndarray], Dict[str, Dict[str, Any]], set]:
+    checkpoint_path = get_checkpoint_path()
+    if os.path.exists(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        probs_dict = checkpoint.get("probs", {})
+        meta_dict = checkpoint.get("meta", {})
+        completed_keys = set(checkpoint.get("completed_keys", []))
+        print(f"  Loaded {len(completed_keys)} completed probes")
+        return probs_dict, meta_dict, completed_keys
+    else:
+        print("No checkpoint found, starting fresh")
+        return {}, {}, set()
+
+
+def save_checkpoint(
+    probs_dict: Dict[str, np.ndarray],
+    meta_dict: Dict[str, Dict[str, Any]],
+    completed_keys: set,
+    additional_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    checkpoint_path = get_checkpoint_path()
+    os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
+
+    checkpoint: Dict[str, Any] = {
+        "probs": probs_dict,
+        "meta": meta_dict,
+        "completed_keys": list(completed_keys),
+    }
+    if additional_data:
+        checkpoint.update(additional_data)
+
+    torch.save(checkpoint, checkpoint_path)
+    print(f"  Checkpoint saved ({len(completed_keys)} probes completed)")
+
+
+def save_probe_result(
+    key: str,
+    probs: np.ndarray,
+    metadata: Dict[str, Any],
+    probs_dict: Dict[str, np.ndarray],
+    meta_dict: Dict[str, Dict[str, Any]],
+    completed_keys: set,
+    additional_data: Optional[Dict[str, Any]] = None,
+) -> None:
+    probs_dict[key] = probs
+    meta_dict[key] = metadata
+    completed_keys.add(key)
+    save_checkpoint(probs_dict, meta_dict, completed_keys, additional_data)
+
+
+# -------------------------
+#  Main
+# -------------------------
 
 
 def main(
     mode: str,
     balance: bool = False,
+    use_sae_probes: bool = False,
+    use_attention_probes: bool = False,
+    hook_type: str = "resid_post",
+    restart: bool = False,
+    token_pooling: str = "single",
+    pool_k: int = 4,
+    token_offset: int = 0,
+    include_subanswer: bool = True,
 ) -> None:
+    assert hook_type in ("resid_post", "resid_pre")
+    assert token_pooling in ("single", "mean_last_k")
     full_run = mode != "test"
     print(
-        f"Running in mode: {mode!r} (full_run={full_run}, balance={balance})"
+        f"Running mode={mode!r} (full_run={full_run}, balance={balance}, "
+        f"use_sae_probes={use_sae_probes}, use_attention_probes={use_attention_probes}, "
+        f"hook_type={hook_type}, restart={restart}, token_pooling={token_pooling}, "
+        f"pool_k={pool_k}, token_offset={token_offset}, include_subanswer={include_subanswer})"
     )
 
-    # Reproducibility
+    os.makedirs("trained_probes2", exist_ok=True)
+
+    if restart:
+        print("Restarting from scratch (ignoring any existing checkpoint)")
+        probs_dict: Dict[str, np.ndarray] = {}
+        meta_dict: Dict[str, Dict[str, Any]] = {}
+        completed_keys: set = set()
+    else:
+        probs_dict, meta_dict, completed_keys = load_checkpoint()
+
     rng = np.random.default_rng(42)
     torch.manual_seed(42)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
     # Load dataset
-    contexts_dict, y_correct, y_recall_full = load_hotpot_decomp_dataset(
-        JSON_DATASET_PATH
-    )
+    (
+        contexts_dict,
+        y_correct,
+        y_recall_full,
+        y_subanswer_correct,
+        y_subanswer_recall_full,
+        question_to_subanswer_indices,
+    ) = load_hotpot_decomp_dataset(JSON_DATASET_PATH)
     n_total = len(contexts_dict["planning"])
-    print(f"Loaded {n_total} examples from dataset.")
+    n_subanswer_total = len(contexts_dict["subanswer"])
+    print(f"Loaded {n_total} examples from dataset ({n_subanswer_total} subanswers).")
 
-    # Subsample for full vs test run
+    # Subsample questions
     if full_run:
         max_examples = min(3000, n_total)
     else:
         max_examples = min(32, n_total)
 
-    indices = np.arange(n_total)
-    rng.shuffle(indices)
-    indices = indices[:max_examples]
+    question_indices = np.arange(n_total)
+    rng.shuffle(question_indices)
+    question_indices = question_indices[:max_examples]
+    question_indices_sorted = np.sort(question_indices)
 
-    # Subsample all context types
-    contexts_dict = {
-        key: [contexts_list[i] for i in indices]
-        for key, contexts_list in contexts_dict.items()
-    }
-    y_correct = y_correct[indices]
-    y_recall_full = y_recall_full[indices]
+    # Subsample contexts for planning and final (one per question)
+    contexts_dict["planning"] = [contexts_dict["planning"][i] for i in question_indices_sorted]
+    contexts_dict["final"] = [contexts_dict["final"][i] for i in question_indices_sorted]
+    y_correct = y_correct[question_indices_sorted]
+    y_recall_full = y_recall_full[question_indices_sorted]
+
+    # Subsample subanswers
+    subanswer_indices_list: List[int] = []
+    question_to_subanswer_indices_subsampled: List[List[int]] = []
+    for q_idx in question_indices_sorted:
+        sa_indices = question_to_subanswer_indices[q_idx]
+        new_sa_indices = []
+        for old_sa_idx in sa_indices:
+            new_sa_idx = len(subanswer_indices_list)
+            subanswer_indices_list.append(old_sa_idx)
+            new_sa_indices.append(new_sa_idx)
+        question_to_subanswer_indices_subsampled.append(new_sa_indices)
+
+    contexts_dict["subanswer"] = [contexts_dict["subanswer"][i] for i in subanswer_indices_list]
+    y_subanswer_correct = y_subanswer_correct[subanswer_indices_list]
+    y_subanswer_recall_full = y_subanswer_recall_full[subanswer_indices_list]
+
     n = len(contexts_dict["planning"])
-    print(f"Using {n} examples after subsampling (max_examples={max_examples}).")
+    n_subanswer = len(contexts_dict["subanswer"])
+    print(f"Using {n} examples after subsampling (max_examples={max_examples}, {n_subanswer} subanswers).")
 
-    # Create splits
+    # Splits for questions
     train_idx, val_idx, test_idx = make_splits(n, rng)
     print(
-        f"Split sizes: train={len(train_idx)}, val={len(val_idx)}, "
+        f"Question split sizes: train={len(train_idx)}, val={len(val_idx)}, "
         f"test={len(test_idx)}"
     )
+
+    # Splits for subanswers
+    subanswer_train_idx_list: List[int] = []
+    subanswer_val_idx_list: List[int] = []
+    subanswer_test_idx_list: List[int] = []
+    for q_idx in train_idx:
+        subanswer_train_idx_list.extend(question_to_subanswer_indices_subsampled[q_idx])
+    for q_idx in val_idx:
+        subanswer_val_idx_list.extend(question_to_subanswer_indices_subsampled[q_idx])
+    for q_idx in test_idx:
+        subanswer_test_idx_list.extend(question_to_subanswer_indices_subsampled[q_idx])
+    subanswer_train_idx = np.array(subanswer_train_idx_list, dtype=np.int64)
+    subanswer_val_idx = np.array(subanswer_val_idx_list, dtype=np.int64)
+    subanswer_test_idx = np.array(subanswer_test_idx_list, dtype=np.int64)
+    print(
+        f"Subanswer split sizes: train={len(subanswer_train_idx)}, val={len(subanswer_val_idx)}, "
+        f"test={len(subanswer_test_idx)}"
+    )
+
+    additional_data = {
+        "y_correct": y_correct,
+        "y_recall_full": y_recall_full,
+        "train_idx": train_idx,
+        "val_idx": val_idx,
+        "test_idx": test_idx,
+        "y_subanswer_correct": y_subanswer_correct,
+        "y_subanswer_recall_full": y_subanswer_recall_full,
+        "subanswer_train_idx": subanswer_train_idx,
+        "subanswer_val_idx": subanswer_val_idx,
+        "subanswer_test_idx": subanswer_test_idx,
+        "token_pooling": token_pooling,
+        "pool_k": pool_k,
+        "token_offset": token_offset,
+    }
 
     # Load model
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -822,7 +1168,7 @@ def main(
         dtype=torch.float16,
     )
 
-    # Decide which layers to probe
+    # Decide layers
     preferred_layers = [4, 8, 12, 16, 20, 24, 28, 31]
     n_layers = model.cfg.n_layers
     layers_available = [l for l in preferred_layers if l < n_layers]
@@ -831,54 +1177,163 @@ def main(
 
     if full_run:
         layers_to_probe = layers_available
+        layers_for_attn = (
+            layers_available[-2:] if len(layers_available) >= 2 else layers_available
+        )
+        layers_for_sae = (
+            layers_available[-4:] if len(layers_available) >= 4 else layers_available
+        )
     else:
-        layers_to_probe = [layers_available[-1]]  # final-ish layer only
+        layers_to_probe = [layers_available[-1]]
+        layers_for_attn = layers_to_probe
+        layers_for_sae = layers_to_probe
 
-    print(f"Layers to probe: {layers_to_probe}")
+    print(f"Layers_to_probe = {layers_to_probe}")
+    if use_attention_probes:
+        print(f"Layers_for_attention = {layers_for_attn}")
+    if use_sae_probes:
+        print(f"Layers_for_SAE = {layers_for_sae}")
 
-    # Compute activations for each context type
-    hidden_per_layer_dict = {}
-    for context_type, contexts in contexts_dict.items():
-        print(f"\nComputing activations for {context_type}...")
-        hidden_per_layer_dict[context_type] = compute_activations(
-            model, contexts, layers_to_probe, full_run=full_run
+    # Per context type
+    context_types = ["planning", "final"]
+    if include_subanswer:
+        context_types.insert(1, "subanswer")
+    
+    for context_type in context_types:
+        print(f"\n{'='*70}\nProcessing context type: {context_type}\n{'='*70}")
+        texts = contexts_dict[context_type]
+
+        if context_type == "subanswer":
+            y_ctx_correct = y_subanswer_correct
+            y_ctx_recall_full = y_subanswer_recall_full
+            ctx_train_idx = subanswer_train_idx
+            ctx_val_idx = subanswer_val_idx
+            ctx_test_idx = subanswer_test_idx
+        else:
+            y_ctx_correct = y_correct
+            y_ctx_recall_full = y_recall_full
+            ctx_train_idx = train_idx
+            ctx_val_idx = val_idx
+            ctx_test_idx = test_idx
+
+        # Tokenize (no truncation)
+        tokens_list, lengths = tokenize_contexts(model, texts)
+
+        # Pooled activations
+        final_acts = compute_token_activations(
+            model,
+            tokens_list,
+            lengths,
+            layers_to_probe,
+            hook_type=hook_type,
+            full_run=full_run,
+            token_pooling=token_pooling,
+            pool_k=pool_k,
+            token_offset=token_offset,
         )
 
-    # Free model; we only need stored features now.
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    # Train all probes for each context type
-    all_results = []
-    for context_type in ["planning", "subanswer", "final"]:
-        print(f"\n{'='*60}")
-        print(f"Training probes for context type: {context_type}")
-        print(f"{'='*60}")
-        results = train_all_probes(
-            hidden_per_layer_dict[context_type],
-            y_correct,
-            y_recall_full,
-            train_idx,
-            val_idx,
-            test_idx,
+        # Dense / MassMean / MLP
+        train_dense_mass_mlp_for_context(
+            context_type,
+            final_acts,
+            y_ctx_correct,
+            y_ctx_recall_full,
+            ctx_train_idx,
+            ctx_val_idx,
+            ctx_test_idx,
             layers_to_probe,
             full_run=full_run,
             balance=balance,
             rng=rng,
-            context_type=context_type,
+            hook_type=hook_type,
+            probs_dict=probs_dict,
+            meta_dict=meta_dict,
+            completed_keys=completed_keys,
+            additional_data=additional_data,
         )
-        all_results.extend(results)
-    
-    # Print summary of best probes
-    print_best_probes(all_results)
+
+        # SAE probes
+        if use_sae_probes:
+            sae_latents = compute_sae_latents_per_layer(
+                final_acts,
+                layers_for_sae,
+                device=device,
+            )
+            train_sae_dense_for_context(
+                context_type,
+                sae_latents,
+                y_ctx_correct,
+                y_ctx_recall_full,
+                ctx_train_idx,
+                ctx_val_idx,
+                ctx_test_idx,
+                layers_for_sae,
+                full_run=full_run,
+                balance=balance,
+                rng=rng,
+                hook_type=hook_type,
+                probs_dict=probs_dict,
+                meta_dict=meta_dict,
+                completed_keys=completed_keys,
+                additional_data=additional_data,
+            )
+
+        # Attention probes
+        if use_attention_probes:
+            train_attention_for_context_streaming(
+                context_type,
+                tokens_list,
+                lengths,
+                model,
+                y_ctx_correct,
+                y_ctx_recall_full,
+                ctx_train_idx,
+                ctx_val_idx,
+                ctx_test_idx,
+                layers_for_attn,
+                full_run=full_run,
+                balance=balance,
+                rng=rng,
+                hook_type=hook_type,
+                probs_dict=probs_dict,
+                meta_dict=meta_dict,
+                completed_keys=completed_keys,
+                additional_data=additional_data,
+            )
+
+    # Free model
+    del model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Save predictions + metadata
+    payload = {
+        "y_correct": y_correct,
+        "y_recall_full": y_recall_full,
+        "train_idx": train_idx,
+        "val_idx": val_idx,
+        "test_idx": test_idx,
+        "y_subanswer_correct": y_subanswer_correct,
+        "y_subanswer_recall_full": y_subanswer_recall_full,
+        "subanswer_train_idx": subanswer_train_idx,
+        "subanswer_val_idx": subanswer_val_idx,
+        "subanswer_test_idx": subanswer_test_idx,
+        "probs": probs_dict,
+        "meta": meta_dict,
+        "token_pooling": token_pooling,
+        "pool_k": pool_k,
+        "token_offset": token_offset,
+    }
+    out_path = os.path.join("trained_probes2", "probe_predictions.pt")
+    torch.save(payload, out_path)
+    print(f"\nSaved per-example probabilities + metadata to {out_path}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Train lightweight probes on Llama-3.1-8B activations for "
-            "HotpotQA decomposition dataset."
+            "Train probes on Llama-3.1-8B-Instruct activations for HotpotQA "
+            "decomposition dataset, and save per-example probabilities."
         )
     )
     parser.add_argument(
@@ -886,23 +1341,80 @@ if __name__ == "__main__":
         nargs="?",
         choices=["full", "test"],
         default="full",
-        help=(
-            "Run mode: 'full' for full training run (default), "
-            "'test' for a tiny smoke test that runs very quickly."
-        ),
+        help="Run mode: 'full' (default) or 'test' for a tiny smoke test.",
     )
     parser.add_argument(
         "--balance",
         action="store_true",
         default=False,
+        help="Balance the training split for each task (downsample positives/negatives).",
+    )
+    parser.add_argument(
+        "--use_sae_probes",
+        action="store_true",
+        default=False,
+        help="Also train SAE-based dense probes (requires sae_lens).",
+    )
+    parser.add_argument(
+        "--use_attention_probes",
+        action="store_true",
+        default=False,
+        help="Also train attention-style pooling probes over all tokens (streaming).",
+    )
+    parser.add_argument(
+        "--hook_type",
+        choices=["resid_post", "resid_pre"],
+        default="resid_post",
+        help="Which residual stream hook to use (default: resid_post).",
+    )
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        default=False,
+        help="Restart training from scratch, ignoring any existing checkpoint.",
+    )
+    parser.add_argument(
+        "--token_pooling",
+        choices=["single", "mean_last_k"],
+        default="single",
         help=(
-            "Deprecated: class balancing is now always applied to the training set. "
-            "This flag is kept for backwards compatibility but has no effect."
+            "How to pool token activations before probing: "
+            "'single' (a single token from the end, offset by --token_offset) or "
+            "'mean_last_k' (mean over last --pool_k tokens)."
         ),
     )
+    parser.add_argument(
+        "--pool_k",
+        type=int,
+        default=3,
+        help="Number of tokens to pool over for 'mean_last_k' token pooling.",
+    )
+    parser.add_argument(
+        "--token_offset",
+        type=int,
+        default=0,
+        help=(
+            "Offset from the final token when token_pooling='single'. "
+            "0 = last token, 1 = second-to-last, etc."
+        ),
+    )
+    parser.add_argument(
+        "--no_subanswer",
+        action="store_true",
+        default=False,
+        help="Skip training probes on subanswer contexts (default: include subanswer training).",
+    )
+
     args = parser.parse_args()
     main(
         args.mode,
         balance=args.balance,
+        use_sae_probes=args.use_sae_probes,
+        use_attention_probes=args.use_attention_probes,
+        hook_type=args.hook_type,
+        restart=args.restart,
+        token_pooling=args.token_pooling,
+        pool_k=args.pool_k,
+        token_offset=args.token_offset,
+        include_subanswer=not args.no_subanswer,
     )
-
