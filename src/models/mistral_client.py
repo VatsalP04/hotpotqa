@@ -123,6 +123,31 @@ class MistralClient:
         
         response = self.chat(messages, **kwargs)
         return response["content"]
+    
+    def embed(
+        self,
+        texts: List[str],
+        model: str = "mistral-embed"
+    ) -> List[List[float]]:
+        """
+        Generate embeddings for a list of texts.
+        
+        Args:
+            texts: List of text strings to embed.
+            model: Embedding model to use (default: mistral-embed).
+        
+        Returns:
+            List of embedding vectors (each vector is a list of floats).
+        """
+        if not texts:
+            return []
+        
+        response = self.client.embeddings.create(
+            model=model,
+            inputs=texts
+        )
+        
+        return [data.embedding for data in response.data]
 
 # Convenience function for quick access
 def get_mistral_client(**kwargs) -> MistralClient:

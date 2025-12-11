@@ -46,12 +46,13 @@ from .qa_reader import QAReader, QAResult
 from .retriever import (
     Paragraph, 
     Retriever, 
-    FAISSRetriever,
     InMemoryRetriever,
     Sentence,
     ParagraphWithSentences,
     DistractorRetrieverAdapter,
-    load_faiss_retriever_from_notebooks,
+    SentenceRetriever,
+    context_window_expand,
+    SentenceWindowRetriever,
 )
 
 __all__ = [
@@ -67,11 +68,13 @@ __all__ = [
     "QAResult",
     "Paragraph",
     "Retriever",
-    "FAISSRetriever",
     "InMemoryRetriever",
     "Sentence",
     "ParagraphWithSentences",
     "DistractorRetrieverAdapter",
+    "SentenceRetriever",
+    "context_window_expand",
+    "SentenceWindowRetriever",
     "load_faiss_retriever_from_notebooks",
 ]
 
